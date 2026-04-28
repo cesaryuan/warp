@@ -294,6 +294,15 @@ pub struct AgentDriver {
     /// for resumed conversations); used by `unregister_streamer_consumer`
     /// at end of run.
     streamer_registered_conversation_id: Arc<Mutex<Option<AIConversationId>>>,
+
+    /// The parent agent run's `run_id`, when this driver run was spawned
+    /// by another agent (via `start_agent` or the public spawn API).
+    /// Sourced from the server task metadata. Stamped onto the
+    /// conversation's `parent_agent_id` field at register time so that
+    /// the streamer's child-role check succeeds in driver-hosted
+    /// processes (CLI subprocesses, cloud workers), which never see the
+    /// parent's local `AIConversationId`.
+    parent_run_id: Option<String>,
 }
 
 pub(crate) enum SDKConversationOutputStatus {
@@ -599,6 +608,10 @@ impl AgentDriver {
 
         // Inject cloud provider env vars.
         cloud_provider::collect_env_vars(&cloud_providers, &mut env_vars)?;
+        // Clone before consuming `parent_run_id` for env vars; the field on
+        // `Self` is needed at register time to stamp `parent_agent_id` onto
+        // the conversation so the streamer recognizes the child role.
+        let parent_run_id_for_self = parent_run_id.clone();
         env_vars.extend(task_env_vars(
             task_id.as_ref(),
             parent_run_id.as_deref(),
@@ -636,6 +649,7 @@ impl AgentDriver {
         // can satisfy the parent gate as soon as a child is registered.
         if let Some(conv_id) = restored_conversation_id {
             if warp_core::features::FeatureFlag::OrchestrationV2.is_enabled() {
+                stamp_parent_agent_id_if_some(conv_id, parent_run_id_for_self.as_deref(), ctx);
                 crate::ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::handle(
                     ctx,
                 )
@@ -673,6 +687,7 @@ impl AgentDriver {
             resume_payload,
             streamer_consumer_id,
             streamer_registered_conversation_id,
+            parent_run_id: parent_run_id_for_self,
         })
     }
 
@@ -1751,6 +1766,7 @@ impl AgentDriver {
         let streamer_consumer_id = self.streamer_consumer_id;
         let streamer_registered_conversation_id =
             Arc::clone(&self.streamer_registered_conversation_id);
+        let parent_run_id_for_closure = self.parent_run_id.clone();
 
         ctx.subscribe_to_model(&history_model_handle, move |me, event, ctx| {
             if event.terminal_view_id().is_some_and(|id| id != terminal_id) {
@@ -1772,6 +1788,16 @@ impl AgentDriver {
                         if let Ok(mut guard) = streamer_registered_conversation_id.lock() {
                             *guard = Some(conv_id);
                         }
+                        // Stamp the parent's run_id onto the conversation
+                        // BEFORE registering the consumer, so the
+                        // streamer's eligibility check sees the child role
+                        // when the consumer registration triggers
+                        // re-evaluation.
+                        stamp_parent_agent_id_if_some(
+                            conv_id,
+                            parent_run_id_for_closure.as_deref(),
+                            ctx,
+                        );
                         crate::ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::handle(
                             ctx,
                         )
@@ -2392,6 +2418,29 @@ pub(super) async fn report_driver_error(
             anyhow!(e).context(format!("Failed to report driver error for task {task_id}"))
         );
     }
+}
+
+/// Stamps `parent_agent_id` onto a conversation in the local
+/// `BlocklistAIHistoryModel` if a `parent_run_id` is provided. Under
+/// orchestration v2, `parent_agent_id` IS the parent's run_id. The
+/// agent_sdk driver calls this at register time so the streamer's
+/// child-role check (`is_child_agent_conversation`) succeeds in
+/// driver-hosted processes (CLI subprocesses, cloud workers), which
+/// never see the parent's local `AIConversationId`.
+fn stamp_parent_agent_id_if_some(
+    conv_id: AIConversationId,
+    parent_run_id: Option<&str>,
+    ctx: &mut ModelContext<AgentDriver>,
+) {
+    let Some(parent_run_id) = parent_run_id else {
+        return;
+    };
+    let parent_run_id = parent_run_id.to_owned();
+    BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, _| {
+        if let Some(conv) = history.conversation_mut(&conv_id) {
+            conv.set_parent_agent_id(parent_run_id);
+        }
+    });
 }
 
 /// Extracts the `AIConversationId` from a `BlocklistAIHistoryEvent` if the

@@ -429,6 +429,20 @@ impl OrchestrationEventStreamer {
 
     // ---- Eligibility predicate ---------------------------------------
 
+    /// True iff the conversation has a parent agent run from this
+    /// process's perspective. Two signals satisfy this:
+    ///
+    /// - `parent_conversation_id.is_some()` — the parent has a local
+    ///   placeholder in this process (typically the parent's GUI), set
+    ///   by `start_new_child_conversation` when the child was spawned.
+    /// - `parent_agent_id.is_some()` — the conversation knows its
+    ///   parent's server-side agent identifier (under v2, the parent's
+    ///   `run_id`). This is the signal available in driver-hosted
+    ///   processes (CLI subprocesses, cloud workers) which never see the
+    ///   parent's local `AIConversationId` but do know the parent's
+    ///   run_id from the task metadata. The agent_sdk driver stamps this
+    ///   field onto the conversation at register time so the streamer's
+    ///   child-role check succeeds in the driver process.
     fn is_child_agent_conversation(
         &self,
         conversation_id: AIConversationId,
@@ -436,7 +450,7 @@ impl OrchestrationEventStreamer {
     ) -> bool {
         BlocklistAIHistoryModel::as_ref(ctx)
             .conversation(&conversation_id)
-            .is_some_and(|c| c.is_child_agent_conversation())
+            .is_some_and(|c| c.is_child_agent_conversation() || c.parent_agent_id().is_some())
     }
 
     fn self_run_id(
