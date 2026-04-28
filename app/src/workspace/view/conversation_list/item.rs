@@ -39,10 +39,11 @@ const ICON_SPACING: f32 = 4.;
 const DIALOG_OFFSET_PIXELS: f32 = -16.;
 
 /// Total size of the agent icon-with-status component rendered in each conversation list
-/// row. Sized to match the surrounding `render_status_element` footprint
-/// (`font_size + STATUS_ELEMENT_PADDING * 2.`) so adopting the unified icon doesn't
-/// shift row heights.
-const LIST_ITEM_AGENT_SIZE: f32 = 16.;
+/// row.
+const LIST_ITEM_AGENT_SIZE: f32 = 22.;
+/// How far to inset the status overlay from the icon's BR corner, as a fraction of
+/// `LIST_ITEM_AGENT_SIZE`. Zero means the overlay's BR sits flush with the icon's BR.
+const LIST_ITEM_OVERLAY_INSET_RATIO: f32 = 0.;
 
 /// Generate a position ID for a conversation list item
 fn conversation_item_position_id(id: &ConversationOrTaskId) -> String {
@@ -209,9 +210,13 @@ pub fn render_item(props: ItemProps<'_>, app: &AppContext) -> Box<dyn Element> {
     // but keeps the surface future-proof).
     let icon_element: Box<dyn Element> =
         match conversation_or_task_agent_icon_variant(conversation, app) {
-            Some(variant) => {
-                render_icon_with_status(variant, LIST_ITEM_AGENT_SIZE, theme, theme.background())
-            }
+            Some(variant) => render_icon_with_status(
+                variant,
+                LIST_ITEM_AGENT_SIZE,
+                LIST_ITEM_OVERLAY_INSET_RATIO,
+                theme,
+                theme.background(),
+            ),
             None => render_status_element(&conversation.status(app), font_size, appearance),
         };
 

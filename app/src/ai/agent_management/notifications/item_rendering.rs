@@ -399,6 +399,9 @@ fn render_message_text(message: &str, expanded: bool, appearance: &Appearance) -
 
 /// Total size of the agent avatar component rendered alongside each notification.
 const NOTIFICATION_AVATAR_SIZE: f32 = 32.;
+/// How far to inset the status / cloud overlay from the avatar's BR corner, as a
+/// fraction of `NOTIFICATION_AVATAR_SIZE`.
+const NOTIFICATION_OVERLAY_INSET_RATIO: f32 = 0.05;
 
 fn render_agent_avatar(
     agent: NotificationSourceAgent,
@@ -417,7 +420,13 @@ fn render_agent_avatar(
             is_ambient,
         },
     };
-    render_icon_with_status(variant, NOTIFICATION_AVATAR_SIZE, theme, theme.surface_2())
+    render_icon_with_status(
+        variant,
+        NOTIFICATION_AVATAR_SIZE,
+        NOTIFICATION_OVERLAY_INSET_RATIO,
+        theme,
+        theme.surface_2(),
+    )
 }
 
 fn notification_category_to_conversation_status(

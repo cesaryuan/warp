@@ -50,7 +50,12 @@ use warpui::{AppContext, Element, ModelHandle, SingletonEntity, TypedActionView,
 
 /// Total size of the agent icon-with-status component rendered in the pane header.
 /// Sub-components (circle, badge, cloud) are derived inside `render_icon_with_status`.
-const PANE_HEADER_AGENT_SIZE: f32 = 18.;
+/// Sized so the component fits comfortably within `PANE_HEADER_HEIGHT` (34px) with a
+/// few pixels of vertical buffer.
+const PANE_HEADER_AGENT_SIZE: f32 = 26.;
+/// How far to inset the status / cloud overlay from the icon's BR corner, as a
+/// fraction of `PANE_HEADER_AGENT_SIZE`.
+const PANE_HEADER_OVERLAY_INSET_RATIO: f32 = 0.05;
 
 impl TerminalView {
     /// Returns a reference to the focus handle if one has been set.
@@ -294,7 +299,13 @@ impl TerminalView {
         };
         let theme = appearance.theme();
         let render_agent_circle = |variant| {
-            render_icon_with_status(variant, PANE_HEADER_AGENT_SIZE, theme, theme.background())
+            render_icon_with_status(
+                variant,
+                PANE_HEADER_AGENT_SIZE,
+                PANE_HEADER_OVERLAY_INSET_RATIO,
+                theme,
+                theme.background(),
+            )
         };
         let pane_indicator = if should_render_ambient_agent_indicator {
             // Shared/viewed ambient session: route through the shared helper so the pane header
