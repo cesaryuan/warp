@@ -468,14 +468,30 @@ impl OrchestrationEventStreamer {
             .is_some_and(|s| !s.is_empty())
     }
 
+    /// True iff this conversation is a viewer of a shared session run
+    /// hosted elsewhere. Viewers must never subscribe — the actual agent
+    /// (in another process) is the inbox; subscribing here would
+    /// re-inject events that have already been processed.
+    fn is_viewing_shared_session(
+        &self,
+        conversation_id: AIConversationId,
+        ctx: &warpui::AppContext,
+    ) -> bool {
+        BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&conversation_id)
+            .is_some_and(|c| c.is_viewing_shared_session())
+    }
+
     /// True iff this conversation should currently hold an SSE connection.
     /// A subscription is needed only when there is an active consumer in
-    /// this process (an open agent view or an agent_sdk driver). Children
-    /// always have their `self_run_id` watched, so once a consumer
-    /// registers they pick up their inbox; without a local consumer no
-    /// one would observe the events anyway.
+    /// this process (an open agent view or an agent_sdk driver) AND the
+    /// conversation has a real role to consume events for. Shared-session
+    /// viewers are excluded regardless of their other state.
     fn is_eligible(&self, conversation_id: AIConversationId, ctx: &warpui::AppContext) -> bool {
         if !self.has_active_consumer(conversation_id) {
+            return false;
+        }
+        if self.is_viewing_shared_session(conversation_id, ctx) {
             return false;
         }
         self.is_child_agent_conversation(conversation_id, ctx)

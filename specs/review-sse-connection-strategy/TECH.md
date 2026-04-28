@@ -174,21 +174,90 @@ Add unit tests in `orchestration_event_streamer_tests.rs` covering the new invar
 
 Manual validation:
 
-Observation setup. Two log streams cover everything below; have both open in separate terminals before each step.
+Observation setup. Each test below names the process where SSE state should appear: either the user's GUI Warp app (a desktop binary) or a driver process (a local CLI subagent subprocess, or a cloud Oz worker). The relevant log lines are the same in either process; the difference is which log file you tail.
 
-- Client logs from the poller. Existing log lines: `Opening SSE stream for {conversation_id:?} (gen=..., run_ids=..., since=...)` (open) and `SSE driver exited for {conversation_id:?} (gen=...)` (close). The implementation must additionally log on `register_consumer` / `unregister_consumer` and on parent-only teardown so each lifecycle transition is visible. Tail the running client's log for the active build flavor (e.g. `~/Library/Logs/dev.warp.Warp-Stable/warp.log` or the equivalent for the dev build) and grep for `Opening SSE stream`, `SSE driver exited`, `register_consumer`, `unregister_consumer`.
-- Server-side request log. With a local warp-server running, `stream_agent_events` HTTP requests appear in its access log. Filter by path: one request per active SSE; new requests on reconnect; disconnects when the client closes the stream.
+Log lines to watch for, all at info level unless noted:
 
-Runbook. Each step gives expected client log output and server-side observation:
+- `register_consumer for {conv:?}: {consumer_id:?} (total=N)` — a consumer registered.
+- `unregister_consumer for {conv:?}: {consumer_id:?} (remaining=N)` — a consumer unregistered.
+- `Opening SSE stream for {conv:?} (gen=, run_ids=, since=)` — SSE connection opened.
+- `SSE driver exited for {conv:?} (gen=)` — SSE driver task exited (warn level).
+- `Tearing down SSE for {conv:?} (no longer eligible)` — explicit teardown after eligibility flipped to false.
 
-1. **Solo conversation — no subscription.** Start a regular cloud conversation that does not call `start_agent`. Expected client logs: no `Opening SSE stream` line. Server: no `stream_agent_events` request.
-2. **Cloud Oz child — subscribes immediately on run_id assignment.** Spawn a child via `start_agent` (cloud Oz harness). Expected client log on the child: `Opening SSE stream for <child_id> ... run_ids=[<child_run_id>]` immediately when the child receives its server token, with no UI interaction. Expected server: one `stream_agent_events` request for the child. For the *parent*, the same line appears only after the parent's agent view is open AND a child has been registered — with `run_ids` containing the child's run_id.
-3. **Local CLI child (claude-code) — subscribes without an agent view.** Spawn `start_agent` with `execution_mode: local` + `claude-code`. Expected client log: `Opening SSE stream` for the child appears even though no agent view was opened for the child's conversation. Send a message from the parent addressed to the child and confirm the claude-code harness receives it. Repeat with `gemini` if available.
-4. **Top-level cloud Oz parent — subscribes via driver consumer.** Run a cloud Oz agent that spawns a child and observe the cloud worker's logs. Expected: `Opening SSE stream` for the parent inside the worker process, with `run_ids` containing the child's run_id. The driver registration should log on the worker side; without it the parent gate would not be satisfied.
-5. **Parent pane close — parent SSE ends, child SSE persists.** With the parent's pane open and the child running, close the parent's pane. Expected client logs: `unregister_consumer` for the parent, then `SSE driver exited` for the parent. The child's `Opening SSE stream` line is *not* followed by an exit. Server: parent's `stream_agent_events` request disconnects; child's persists.
-6. **Reopen parent — SSE re-establishes with current cursor.** Reopen the parent's agent view. Expected: `register_consumer` followed by `Opening SSE stream` for the parent with `since=<cursor>` matching the last persisted cursor.
-7. **Stale child run_id pruned.** Spawn two children, then delete the second child's conversation. Expected: a new `Opening SSE stream` for the parent with `run_ids` shrunk by one (and a generation bump). Server: the previous parent `stream_agent_events` request disconnects, a new one opens with the smaller run_id list.
-8. **Last child removed leaves a non-child parent with no role.** From step 7, delete the remaining child too. Expected: no new `Opening SSE stream` for the parent; the prior request disconnects and is not replaced. Client logs should show parent teardown.
+Where to tail:
+
+- GUI process: the Warp app log for the active build flavor (e.g. `~/Library/Logs/dev.warp.Warp-Stable/warp.log` on macOS).
+- Local CLI driver subprocess: the subprocess's stderr or its dedicated log file. `start_agent` with `execution_mode: local` runs `warp_cli` as a subprocess; tail wherever that subprocess writes logs.
+- Cloud Oz worker: the worker logs surfaced by the Oz UI / cloud logging tool for the run.
+- Server-side: `stream_agent_events` requests in the dev `warp-server` access log — one request per active SSE; new requests on reconnect; disconnects when the client closes the stream.
+
+### A. Solo conversation
+
+Start a regular cloud conversation. Don't call `start_agent`. Open and close its pane.
+
+- GUI: `register_consumer` and `unregister_consumer` for the conversation, but **no** `Opening SSE stream` line at any point.
+- Server: no `stream_agent_events` request.
+
+### B. Local parent + Local child (both in user's GUI; child runs as a local CLI subagent subprocess)
+
+In the user's GUI, spawn a child via `start_agent` with `execution_mode: local` + a CLI harness (e.g. `claude-code`). The parent's conversation lives in the GUI; the child's run is hosted in a separate driver subprocess.
+
+GUI process expectations:
+
+- With parent's pane open and a child registered: `register_consumer` (AgentView) for parent, then `Opening SSE stream` for parent with `run_ids` containing the child's run_id.
+- Child's `Opening SSE stream` does **not** appear in the GUI unless the user explicitly opens the child's view.
+- Closing parent's pane: `unregister_consumer` for parent, then `SSE driver exited` for parent.
+
+Local CLI driver subprocess expectations:
+
+- At driver startup (after the run_id is assigned via streaming events): `register_consumer` (Driver) for child, then `Opening SSE stream` for child with `run_ids` containing the child's `self_run_id`.
+- When the driver run completes: `unregister_consumer` (Driver) for child, then `Tearing down SSE`.
+
+Server: one `stream_agent_events` request per active SSE.
+
+### C. Local parent + Cloud child (parent in GUI, child in cloud worker)
+
+In the user's GUI, spawn a child via `start_agent` with cloud Oz harness. Parent runs in GUI; child runs on a cloud worker.
+
+GUI process expectations:
+
+- Parent: same as B — SSE only while parent's pane is open and the child run_id is registered.
+- Child: **no** `Opening SSE stream` for the child in the GUI unless the user opens the child's view (e.g. via the cloud agent transcript). The intentional behavior is that child→parent traffic flows through the parent's SSE; the child's own SSE in the GUI would be redundant.
+
+Cloud worker expectations:
+
+- `register_consumer` (Driver) for child on run start, then `Opening SSE stream` for child once `run_id` is assigned.
+- When the run completes: `unregister_consumer` + `Tearing down SSE`.
+
+### D. Cloud parent + Local child (both in same cloud worker process)
+
+A top-level cloud Oz parent driver spawns a CLI subagent locally (in the same worker process). Two `AgentDriver` instances register two `Driver` consumers with the worker's single streamer.
+
+Cloud worker expectations:
+
+- Parent: `register_consumer` (Driver) for parent on run start. Once the parent registers a child run_id (from `start_agent`), `Opening SSE stream` for parent with `run_ids = [child_run_id]`.
+- Child: `register_consumer` (Driver) for child, then `Opening SSE stream` for child with `run_ids = [child_self_run_id]`.
+- Parent and child each unregister and tear down their own SSE when their respective drivers complete.
+
+GUI expectations: parent and child SSEs only if the user has either view open; otherwise nothing.
+
+### E. Cloud parent + Cloud child (separate cloud workers)
+
+Like D but split across two worker processes. The parent worker holds the parent's SSE; the child worker holds the child's SSE. Each driver consumer is in its process. GUI expectations are the same as D.
+
+### F. Shared-session viewer
+
+Open a pane that views someone else's shared session (a viewer of a remote agent's conversation). The local conversation has `is_viewing_shared_session() == true`.
+
+- GUI: `register_consumer` (AgentView) when the pane opens, but **no** `Opening SSE stream` at any point. The viewer guard in `is_eligible` prevents subscription even if the conversation has `parent_conversation_id` set or appears to have a watched run_id.
+- Server: no `stream_agent_events` request from this client for the viewer's conversation_id.
+
+### Specific behaviors to spot-check after running B or C
+
+1. **Stale child run_id pruned.** Spawn two children, then delete the second child's conversation. Expected in the parent's process (GUI for B/C, worker for D/E): a new `Opening SSE stream` for the parent with `run_ids` shrunk by one (and a generation bump). Server: previous parent `stream_agent_events` request disconnects, new one opens with the smaller run_id list.
+2. **Last child removed leaves a non-child parent with no role.** Continuing from (1), delete the remaining child too. Expected: `Tearing down SSE` for the parent; no new `Opening SSE stream` follows.
+3. **Reopen parent — SSE re-establishes with cursor.** Close the parent's pane in the GUI, then reopen. Expected: `register_consumer` followed by `Opening SSE stream` with `since=<cursor>` matching the last persisted cursor.
+4. **Solo with consumer registered.** Open an agent view for a conversation that has no children registered and is not itself a child. Expected: `register_consumer`, but **no** `Opening SSE stream` for that conversation.
 
 Run `./script/presubmit` before opening the PR. Add a `CHANGELOG-IMPROVEMENT:` line for "Tighten orchestration event subscription scope: solo conversations no longer subscribe; parent subscriptions are tied to agent view openness; child subscriptions remain active for the lifetime of the run."
 
