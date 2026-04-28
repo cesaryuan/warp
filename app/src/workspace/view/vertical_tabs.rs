@@ -111,12 +111,6 @@ pub(super) const VERTICAL_TABS_DETAIL_SIDECAR_POSITION_ID: &str = "vertical_tabs
 /// Total size of the icon-with-status component rendered for each vertical-tabs row.
 /// Sub-components (circle, badge, cloud) are derived inside `render_icon_with_status`.
 const VERTICAL_TABS_ICON_SIZE: f32 = 24.;
-/// Where the status / cloud overlay's BR sits relative to the brand circle's BR edge,
-/// as a signed fraction of `VERTICAL_TABS_ICON_SIZE`.
-/// Negative values push the overlay past the circle's BR (toward the bounding box's
-/// BR); this surface sits slightly past the circle's edge so the badge appears to
-/// hang off the bottom-right corner.
-const VERTICAL_TABS_OVERLAY_OFFSET_FROM_CIRCLE_EDGE: f32 = -0.19;
 
 fn vtab_pane_row_position_id(pane_group_id: EntityId, pane_id: PaneId) -> String {
     format!("vertical_tabs:pane_row:{pane_group_id:?}:{pane_id}")
@@ -253,7 +247,7 @@ fn render_pane_icon_with_status(
     render_icon_with_status(
         variant,
         VERTICAL_TABS_ICON_SIZE,
-        VERTICAL_TABS_OVERLAY_OFFSET_FROM_CIRCLE_EDGE,
+        0.,
         theme,
         theme.background(),
     )
@@ -3585,13 +3579,7 @@ fn render_summary_pane_kind_icon_circle(
     // mode). Non-ambient agent kinds and all other pane kinds fall through to the inline
     // circle rendering below.
     if let Some(variant) = ambient_agent_variant(&kind) {
-        return render_icon_with_status(
-            variant,
-            total_size,
-            VERTICAL_TABS_OVERLAY_OFFSET_FROM_CIRCLE_EDGE,
-            theme,
-            theme.background(),
-        );
+        return render_icon_with_status(variant, total_size, 0., theme, theme.background());
     }
     let icon_size = total_size * SUMMARY_INLINE_ICON_RATIO;
     let padding = total_size * SUMMARY_INLINE_PADDING_RATIO;

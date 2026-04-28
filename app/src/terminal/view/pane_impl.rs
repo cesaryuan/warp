@@ -53,12 +53,6 @@ use warpui::{AppContext, Element, ModelHandle, SingletonEntity, TypedActionView,
 /// Sized so the component fits comfortably within `PANE_HEADER_HEIGHT` (34px) with a
 /// few pixels of vertical buffer.
 const PANE_HEADER_AGENT_SIZE: f32 = 26.;
-/// Where the status / cloud overlay's BR sits relative to the brand circle's BR edge,
-/// as a signed fraction of `PANE_HEADER_AGENT_SIZE`.
-/// Negative values push the overlay past the circle's BR (toward the bounding box's
-/// BR); this surface sits slightly past the circle's edge so the badge appears to
-/// hang off the bottom-right corner.
-const PANE_HEADER_OVERLAY_OFFSET_FROM_CIRCLE_EDGE: f32 = -0.19;
 
 impl TerminalView {
     /// Returns a reference to the focus handle if one has been set.
@@ -305,7 +299,7 @@ impl TerminalView {
             render_icon_with_status(
                 variant,
                 PANE_HEADER_AGENT_SIZE,
-                PANE_HEADER_OVERLAY_OFFSET_FROM_CIRCLE_EDGE,
+                0.,
                 theme,
                 theme.background(),
             )

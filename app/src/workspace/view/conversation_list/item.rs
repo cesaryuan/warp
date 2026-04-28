@@ -41,12 +41,11 @@ const DIALOG_OFFSET_PIXELS: f32 = -16.;
 /// Total size of the agent icon-with-status component rendered in each conversation list
 /// row.
 const LIST_ITEM_AGENT_SIZE: f32 = 22.;
-/// Where the status overlay's BR sits relative to the brand circle's BR edge, as a
-/// signed fraction of `LIST_ITEM_AGENT_SIZE`.
-/// `-(1 - CIRCLE_RATIO) ≈ -0.24` puts the overlay's BR exactly on the bounding box's
-/// BR corner, so the badge appears to hang off the circle's bottom-right (matches the
-/// Figma natural overlap).
-const LIST_ITEM_OVERLAY_OFFSET_FROM_CIRCLE_EDGE: f32 = -0.24;
+/// Extra overhang past the default overlay position, as a fraction of
+/// `LIST_ITEM_AGENT_SIZE`. Pushes the badge all the way to the bounding box's BR
+/// corner, matching the Figma natural overlap; the conversation list reads better
+/// with the status sitting slightly further out than the other surfaces.
+const LIST_ITEM_OVERLAY_EXTRA_OVERHANG: f32 = 0.05;
 
 /// Generate a position ID for a conversation list item
 fn conversation_item_position_id(id: &ConversationOrTaskId) -> String {
@@ -216,7 +215,7 @@ pub fn render_item(props: ItemProps<'_>, app: &AppContext) -> Box<dyn Element> {
             Some(variant) => render_icon_with_status(
                 variant,
                 LIST_ITEM_AGENT_SIZE,
-                LIST_ITEM_OVERLAY_OFFSET_FROM_CIRCLE_EDGE,
+                LIST_ITEM_OVERLAY_EXTRA_OVERHANG,
                 theme,
                 theme.background(),
             ),
