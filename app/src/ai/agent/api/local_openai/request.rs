@@ -39,6 +39,7 @@ pub(super) async fn start_local_responses_eventsource(
         .ok_or_else(|| anyhow!("OpenAI base URL is required for the local OpenAI backend"))?;
     let endpoint = normalize_responses_endpoint(&base_url);
 
+    ensure_conversation_state_initialized(params)?;
     let new_input_items = convert_inputs_to_response_items(&params.input)?;
     {
         let mut state_store = conversation_state_store().lock();
@@ -112,6 +113,21 @@ pub(super) fn convert_inputs_to_response_items(
                     result.id.to_string(),
                     result.to_string(),
                 ));
+            }
+            AIAgentInput::AutoCodeDiffQuery { query, context }
+            | AIAgentInput::CreateNewProject { query, context } => {
+                items.push(user_message_item(query, context, None));
+            }
+            AIAgentInput::CloneRepository {
+                clone_repo_url,
+                context,
+            } => {
+                let query = format!("Clone {}", clone_repo_url.clone().into_url());
+                items.push(user_message_item(&query, context, None));
+            }
+            AIAgentInput::FetchReviewComments { repo_path, context } => {
+                let query = format!("Fetch review comments for {repo_path}");
+                items.push(user_message_item(&query, context, None));
             }
             unsupported => {
                 return Err(anyhow!(
@@ -462,5 +478,475 @@ fn is_supported_reasoning_effort(value: &str) -> bool {
     matches!(
         value,
         "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+    )
+}
+
+/// Seeds local conversation state from task history the first time a conversation uses the local backend.
+fn ensure_conversation_state_initialized(params: &RequestParams) -> anyhow::Result<()> {
+    let mut state_store = conversation_state_store().lock();
+    let state = state_store.entry(params.conversation_id).or_default();
+    if !state.items.is_empty() {
+        return Ok(());
+    }
+
+    state.items = task_history_response_items(params)?;
+    Ok(())
+}
+
+/// Converts the current task's persisted server messages into Responses history items.
+pub(super) fn task_history_response_items(params: &RequestParams) -> anyhow::Result<Vec<Value>> {
+    let Some(task) = task_for_history(params) else {
+        return Ok(Vec::new());
+    };
+
+    let mut items = Vec::new();
+    let mut replayable_tool_call_ids = HashSet::new();
+    for message in &task.messages {
+        let Some(inner) = &message.message else {
+            continue;
+        };
+
+        match inner {
+            api::message::Message::UserQuery(_) | api::message::Message::SystemQuery(_) => {
+                items.extend(history_items_from_message_inputs(message)?);
+            }
+            api::message::Message::AgentOutput(output) => {
+                if !output.text.is_empty() {
+                    items.push(assistant_output_item(&output.text));
+                }
+            }
+            api::message::Message::ToolCall(tool_call) => {
+                let Some(history_item) = tool_call_history_item_from_api(tool_call)? else {
+                    continue;
+                };
+                replayable_tool_call_ids.insert(tool_call.tool_call_id.clone());
+                items.push(history_item);
+            }
+            api::message::Message::ToolCallResult(tool_call_result) => {
+                if !replayable_tool_call_ids.contains(&tool_call_result.tool_call_id) {
+                    continue;
+                }
+                items.extend(history_items_from_message_inputs(message)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(items)
+}
+
+/// Returns the task whose messages should seed the local conversation history.
+fn task_for_history<'a>(params: &'a RequestParams) -> Option<&'a api::Task> {
+    let target_task_id = params.target_task_id.as_ref().map(ToString::to_string);
+    target_task_id
+        .as_deref()
+        .and_then(|task_id| params.tasks.iter().find(|task| task.id == task_id))
+        .or_else(|| params.tasks.first())
+}
+
+/// Converts persisted input-like server messages into Responses history items.
+fn history_items_from_message_inputs(message: &api::Message) -> anyhow::Result<Vec<Value>> {
+    let inputs = user_inputs_from_messages(std::slice::from_ref(message));
+    convert_inputs_to_response_items(&inputs)
+}
+
+/// Converts a persisted tool call into a Responses `function_call` history item when the tool is locally understood.
+fn tool_call_history_item_from_api(
+    tool_call: &api::message::ToolCall,
+) -> anyhow::Result<Option<Value>> {
+    let Some(tool) = tool_call.tool.as_ref() else {
+        return Ok(None);
+    };
+    let Some((name, arguments)) = serialize_api_tool_call(tool)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(json!({
+        "type": "function_call",
+        "call_id": tool_call.tool_call_id,
+        "name": name,
+        "arguments": arguments.to_string(),
+    })))
+}
+
+/// Converts a supported proto tool call into the local backend's function name plus JSON arguments.
+fn serialize_api_tool_call(
+    tool: &api::message::tool_call::Tool,
+) -> anyhow::Result<Option<(String, Value)>> {
+    let serialized = match tool {
+        api::message::tool_call::Tool::RunShellCommand(command) => Some((
+            "run_shell_command".to_string(),
+            json!({
+                "command": command.command,
+                "is_read_only": command.is_read_only,
+                "uses_pager": command.uses_pager,
+                "is_risky": command.is_risky,
+                "risk_category": risk_category_name(command.risk_category),
+            }),
+        )),
+        api::message::tool_call::Tool::ReadFiles(read_files) => Some((
+            "read_files".to_string(),
+            json!({
+                "files": read_files.files.iter().map(serialize_read_file).collect::<Vec<_>>(),
+            }),
+        )),
+        api::message::tool_call::Tool::SearchCodebase(search_codebase) => Some((
+            "search_codebase".to_string(),
+            json!({
+                "query": search_codebase.query,
+                "path_filters": search_codebase.path_filters,
+                "codebase_path": search_codebase.codebase_path,
+            }),
+        )),
+        api::message::tool_call::Tool::Grep(grep) => Some((
+            "grep".to_string(),
+            json!({
+                "queries": grep.queries,
+                "path": grep.path,
+            }),
+        )),
+        #[allow(deprecated)]
+        api::message::tool_call::Tool::FileGlob(glob) => Some((
+            "file_glob".to_string(),
+            json!({
+                "patterns": glob.patterns,
+                "path": glob.path,
+            }),
+        )),
+        api::message::tool_call::Tool::FileGlobV2(glob) => Some((
+            "file_glob_v2".to_string(),
+            json!({
+                "patterns": glob.patterns,
+                "search_dir": glob.search_dir,
+                "max_matches": glob.max_matches,
+                "max_depth": glob.max_depth,
+                "min_depth": glob.min_depth,
+            }),
+        )),
+        api::message::tool_call::Tool::ApplyFileDiffs(diffs) => Some((
+            "apply_file_diffs".to_string(),
+            json!({
+                "summary": diffs.summary,
+                "diffs": diffs.diffs.iter().map(serialize_file_diff).collect::<Vec<_>>(),
+                "new_files": diffs.new_files.iter().map(serialize_new_file).collect::<Vec<_>>(),
+                "deleted_files": diffs.deleted_files.iter().map(serialize_deleted_file).collect::<Vec<_>>(),
+                "v4a_updates": diffs.v4a_updates.iter().map(serialize_v4a_update).collect::<Vec<_>>(),
+            }),
+        )),
+        api::message::tool_call::Tool::ReadMcpResource(resource) => Some((
+            "read_mcp_resource".to_string(),
+            json!({
+                "uri": resource.uri,
+                "server_id": resource.server_id,
+            }),
+        )),
+        api::message::tool_call::Tool::CallMcpTool(tool_call) => Some((
+            "call_mcp_tool".to_string(),
+            json!({
+                "name": tool_call.name,
+                "server_id": tool_call.server_id,
+                "args": tool_call.args.as_ref().map(prost_struct_to_json).transpose()?,
+            }),
+        )),
+        api::message::tool_call::Tool::WriteToLongRunningShellCommand(write) => Some((
+            "write_to_long_running_shell_command".to_string(),
+            json!({
+                "command_id": write.command_id,
+                "input": String::from_utf8_lossy(&write.input).to_string(),
+                "mode": write.mode.as_ref().and_then(write_mode_name),
+            }),
+        )),
+        api::message::tool_call::Tool::ReadShellCommandOutput(read) => Some((
+            "read_shell_command_output".to_string(),
+            json!({
+                "command_id": read.command_id,
+                "delay_seconds": read.delay.as_ref().and_then(read_shell_output_delay_seconds),
+                "on_completion": read.delay.as_ref().is_some_and(is_read_shell_output_on_completion),
+            }),
+        )),
+        api::message::tool_call::Tool::SuggestNewConversation(suggest) => Some((
+            "suggest_new_conversation".to_string(),
+            json!({
+                "message_id": suggest.message_id,
+            }),
+        )),
+        api::message::tool_call::Tool::ReadDocuments(read) => Some((
+            "read_documents".to_string(),
+            json!({
+                "documents": read.documents.iter().map(serialize_read_document).collect::<Vec<_>>(),
+            }),
+        )),
+        api::message::tool_call::Tool::EditDocuments(edit) => Some((
+            "edit_documents".to_string(),
+            json!({
+                "diffs": edit.diffs.iter().map(serialize_document_diff).collect::<Vec<_>>(),
+            }),
+        )),
+        api::message::tool_call::Tool::CreateDocuments(create) => Some((
+            "create_documents".to_string(),
+            json!({
+                "new_documents": create.new_documents.iter().map(serialize_new_document).collect::<Vec<_>>(),
+            }),
+        )),
+        api::message::tool_call::Tool::SuggestPrompt(suggest_prompt) => Some((
+            "suggest_prompt".to_string(),
+            serialize_suggest_prompt(suggest_prompt),
+        )),
+        api::message::tool_call::Tool::OpenCodeReview(_) => {
+            Some(("open_code_review".to_string(), json!({})))
+        }
+        api::message::tool_call::Tool::InitProject(_) => {
+            Some(("init_project".to_string(), json!({})))
+        }
+        api::message::tool_call::Tool::FetchConversation(fetch) => Some((
+            "fetch_conversation".to_string(),
+            json!({
+                "conversation_id": fetch.conversation_id,
+            }),
+        )),
+        api::message::tool_call::Tool::ReadSkill(read_skill) => Some((
+            "read_skill".to_string(),
+            serialize_read_skill(read_skill),
+        )),
+        _ => None,
+    };
+
+    Ok(serialized)
+}
+
+/// Converts a read-files request into the JSON argument format expected by the local backend.
+fn serialize_read_file(file: &api::message::tool_call::read_files::File) -> Value {
+    json!({
+        "name": file.name,
+        "line_ranges": file.line_ranges.iter().map(serialize_line_range).collect::<Vec<_>>(),
+    })
+}
+
+/// Converts a single file line range into the local JSON format.
+fn serialize_line_range(range: &api::FileContentLineRange) -> Value {
+    json!({
+        "start": range.start,
+        "end": range.end,
+    })
+}
+
+/// Converts a file diff entry into the local JSON format.
+fn serialize_file_diff(diff: &api::message::tool_call::apply_file_diffs::FileDiff) -> Value {
+    json!({
+        "file_path": diff.file_path,
+        "search": diff.search,
+        "replace": diff.replace,
+    })
+}
+
+/// Converts a new-file creation entry into the local JSON format.
+fn serialize_new_file(new_file: &api::message::tool_call::apply_file_diffs::NewFile) -> Value {
+    json!({
+        "file_path": new_file.file_path,
+        "content": new_file.content,
+    })
+}
+
+/// Converts a delete-file entry into the local JSON format.
+fn serialize_deleted_file(
+    deleted_file: &api::message::tool_call::apply_file_diffs::DeleteFile,
+) -> Value {
+    json!({
+        "file_path": deleted_file.file_path,
+    })
+}
+
+/// Converts a structured V4A update into the local JSON format.
+fn serialize_v4a_update(
+    update: &api::message::tool_call::apply_file_diffs::V4aFileUpdate,
+) -> Value {
+    json!({
+        "file_path": update.file_path,
+        "move_to": update.move_to,
+        "hunks": update.hunks.iter().map(serialize_v4a_hunk).collect::<Vec<_>>(),
+    })
+}
+
+/// Converts a structured V4A hunk into the local JSON format.
+fn serialize_v4a_hunk(
+    hunk: &api::message::tool_call::apply_file_diffs::v4a_file_update::Hunk,
+) -> Value {
+    json!({
+        "change_context": hunk.change_context,
+        "pre_context": hunk.pre_context,
+        "old": hunk.old,
+        "new": hunk.new,
+        "post_context": hunk.post_context,
+    })
+}
+
+/// Converts a read-documents request entry into the local JSON format.
+fn serialize_read_document(
+    document: &api::message::tool_call::read_documents::Document,
+) -> Value {
+    json!({
+        "document_id": document.document_id,
+        "line_ranges": document.line_ranges.iter().map(serialize_line_range).collect::<Vec<_>>(),
+    })
+}
+
+/// Converts an edit-documents diff into the local JSON format.
+fn serialize_document_diff(
+    diff: &api::message::tool_call::edit_documents::DocumentDiff,
+) -> Value {
+    json!({
+        "document_id": diff.document_id,
+        "search": diff.search,
+        "replace": diff.replace,
+    })
+}
+
+/// Converts a create-documents entry into the local JSON format.
+fn serialize_new_document(
+    document: &api::message::tool_call::create_documents::NewDocument,
+) -> Value {
+    json!({
+        "content": document.content,
+        "title": document.title,
+    })
+}
+
+/// Converts a suggest-prompt tool call into the local JSON argument format.
+fn serialize_suggest_prompt(suggest_prompt: &api::message::tool_call::SuggestPrompt) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "is_trigger_irrelevant".to_string(),
+        Value::Bool(suggest_prompt.is_trigger_irrelevant),
+    );
+
+    if let Some(display_mode) = suggest_prompt.display_mode.as_ref() {
+        match display_mode {
+            api::message::tool_call::suggest_prompt::DisplayMode::InlineQueryBanner(banner) => {
+                payload.insert(
+                    "display_mode".to_string(),
+                    Value::String("inline_query_banner".to_string()),
+                );
+                payload.insert("title".to_string(), Value::String(banner.title.clone()));
+                payload.insert(
+                    "description".to_string(),
+                    Value::String(banner.description.clone()),
+                );
+                payload.insert("query".to_string(), Value::String(banner.query.clone()));
+            }
+            api::message::tool_call::suggest_prompt::DisplayMode::PromptChip(chip) => {
+                payload.insert(
+                    "display_mode".to_string(),
+                    Value::String("prompt_chip".to_string()),
+                );
+                payload.insert("prompt".to_string(), Value::String(chip.prompt.clone()));
+                payload.insert("label".to_string(), Value::String(chip.label.clone()));
+            }
+        }
+    }
+
+    Value::Object(payload)
+}
+
+/// Converts a read-skill tool call into the local JSON argument format.
+fn serialize_read_skill(read_skill: &api::message::tool_call::ReadSkill) -> Value {
+    let mut payload = serde_json::Map::new();
+    if !read_skill.name.is_empty() {
+        payload.insert("name".to_string(), Value::String(read_skill.name.clone()));
+    }
+
+    if let Some(skill_reference) = read_skill.skill_reference.as_ref() {
+        match skill_reference {
+            api::message::tool_call::read_skill::SkillReference::SkillPath(path) => {
+                payload.insert("skill_path".to_string(), Value::String(path.clone()));
+            }
+            api::message::tool_call::read_skill::SkillReference::BundledSkillId(id) => {
+                payload.insert("bundled_skill_id".to_string(), Value::String(id.clone()));
+            }
+        }
+    }
+
+    Value::Object(payload)
+}
+
+/// Converts a protobuf `Struct` into serde JSON for historical MCP tool arguments.
+fn prost_struct_to_json(structure: &prost_types::Struct) -> anyhow::Result<Value> {
+    let mut object = serde_json::Map::new();
+    for (key, value) in &structure.fields {
+        object.insert(key.clone(), prost_value_to_json(value)?);
+    }
+    Ok(Value::Object(object))
+}
+
+/// Converts a protobuf `Value` into serde JSON for historical MCP tool arguments.
+fn prost_value_to_json(value: &prost_types::Value) -> anyhow::Result<Value> {
+    use prost_types::value::Kind;
+
+    let Some(kind) = value.kind.as_ref() else {
+        return Ok(Value::Null);
+    };
+
+    let json_value = match kind {
+        Kind::NullValue(_) => Value::Null,
+        Kind::BoolValue(value) => Value::Bool(*value),
+        Kind::NumberValue(value) => serde_json::Number::from_f64(*value)
+            .map(Value::Number)
+            .ok_or_else(|| anyhow!("Failed to serialize non-finite protobuf number"))?,
+        Kind::StringValue(value) => Value::String(value.clone()),
+        Kind::StructValue(value) => prost_struct_to_json(value)?,
+        Kind::ListValue(value) => Value::Array(
+            value.values
+                .iter()
+                .map(prost_value_to_json)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        ),
+    };
+
+    Ok(json_value)
+}
+
+/// Returns the string name for a persisted shell-command risk category when it is known.
+fn risk_category_name(risk_category: i32) -> Option<&'static str> {
+    match api::RiskCategory::try_from(risk_category).ok()? {
+        api::RiskCategory::Unspecified => None,
+        api::RiskCategory::ReadOnly => Some("read_only"),
+        api::RiskCategory::TrivialLocalChange => Some("trivial_local_change"),
+        api::RiskCategory::NontrivialLocalChange => Some("nontrivial_local_change"),
+        api::RiskCategory::ExternalChange => Some("external_change"),
+        api::RiskCategory::Risky => Some("risky"),
+    }
+}
+
+/// Returns the serialized write mode name for long-running shell input.
+fn write_mode_name(
+    mode: &api::message::tool_call::write_to_long_running_shell_command::Mode,
+) -> Option<&'static str> {
+    use api::message::tool_call::write_to_long_running_shell_command::mode::Mode;
+
+    match mode.mode.as_ref()? {
+        Mode::Raw(_) => Some("raw"),
+        Mode::Line(_) => Some("line"),
+        Mode::Block(_) => Some("block"),
+    }
+}
+
+/// Returns the whole-second delay configured for a read-shell-command-output request, if any.
+fn read_shell_output_delay_seconds(
+    delay: &api::message::tool_call::read_shell_command_output::Delay,
+) -> Option<i64> {
+    match delay {
+        api::message::tool_call::read_shell_command_output::Delay::Duration(duration) => {
+            Some(duration.seconds)
+        }
+        api::message::tool_call::read_shell_command_output::Delay::OnCompletion(_) => None,
+    }
+}
+
+/// Returns whether a read-shell-command-output request waits for completion.
+fn is_read_shell_output_on_completion(
+    delay: &api::message::tool_call::read_shell_command_output::Delay,
+) -> bool {
+    matches!(
+        delay,
+        api::message::tool_call::read_shell_command_output::Delay::OnCompletion(_)
     )
 }
