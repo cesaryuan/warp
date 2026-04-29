@@ -128,8 +128,11 @@ struct StreamingTextMessageState {
 /// Tracks streamed function call arguments for a single Responses tool call.
 #[derive(Debug, Default, Clone)]
 struct StreamingFunctionCallState {
+    output_item_id: Option<String>,
+    provider_call_id: Option<String>,
     name: Option<String>,
     arguments: String,
+    emitted: bool,
 }
 
 /// Aggregates streaming state until the Responses stream completes.
@@ -151,16 +154,28 @@ struct ResponsesTextDeltaEvent {
 /// Minimal typed view over a streamed function call arguments delta event.
 #[derive(Debug, Deserialize)]
 struct ResponsesFunctionCallArgumentsDeltaEvent {
-    call_id: String,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    item_id: Option<String>,
     delta: String,
 }
 
 /// Minimal typed view over a streamed function call arguments done event.
 #[derive(Debug, Deserialize)]
 struct ResponsesFunctionCallArgumentsDoneEvent {
-    call_id: String,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    item_id: Option<String>,
     name: String,
     arguments: String,
+}
+
+/// Minimal typed view over a streamed output item completion event.
+#[derive(Debug, Deserialize)]
+struct ResponsesOutputItemDoneEvent {
+    item: ResponsesOutputItem,
 }
 
 /// Minimal typed view over a streamed completed event.
@@ -708,6 +723,7 @@ fn parse_responses_output(
                 let name = item.name.context("Missing function call name")?;
                 let call_id = item
                     .call_id
+                    .or(item.id)
                     .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
                 let arguments = item
                     .arguments
@@ -772,9 +788,13 @@ fn handle_responses_stream_message(
         "response.function_call_arguments.delta" => {
             let delta_event: ResponsesFunctionCallArgumentsDeltaEvent =
                 serde_json::from_value(payload)?;
+            let function_call_id = streamed_function_call_id(
+                delta_event.call_id.as_deref(),
+                delta_event.item_id.as_deref(),
+            )?;
             accumulator
                 .function_calls_by_call_id
-                .entry(delta_event.call_id)
+                .entry(function_call_id)
                 .or_default()
                 .arguments
                 .push_str(&delta_event.delta);
@@ -783,7 +803,26 @@ fn handle_responses_stream_message(
         "response.function_call_arguments.done" => {
             let done_event: ResponsesFunctionCallArgumentsDoneEvent =
                 serde_json::from_value(payload)?;
-            let function_call = finalize_streamed_function_call(accumulator, done_event)?;
+            let Some(function_call) = finalize_streamed_function_call(accumulator, done_event)?
+            else {
+                return Ok(StreamMessageResult::default());
+            };
+            Ok(StreamMessageResult {
+                events: vec![Ok(add_messages_event(
+                    task_id,
+                    vec![tool_call_message(task_id, request_id, function_call)?],
+                ))],
+                is_terminal: false,
+            })
+        }
+        "response.output_item.done" => {
+            let done_event: ResponsesOutputItemDoneEvent = serde_json::from_value(payload)?;
+            let Some(function_call) =
+                handle_streamed_output_item_done(accumulator, done_event.item)?
+            else {
+                return Ok(StreamMessageResult::default());
+            };
+
             Ok(StreamMessageResult {
                 events: vec![Ok(add_messages_event(
                     task_id,
@@ -877,11 +916,21 @@ fn handle_streamed_text_delta(
 fn finalize_streamed_function_call(
     accumulator: &mut StreamingResponsesAccumulator,
     done_event: ResponsesFunctionCallArgumentsDoneEvent,
-) -> anyhow::Result<ParsedFunctionCall> {
+) -> anyhow::Result<Option<ParsedFunctionCall>> {
+    let function_call_id = reconcile_streamed_function_call_state_key(
+        accumulator,
+        done_event.call_id.as_deref(),
+        done_event.item_id.as_deref(),
+    )?;
     let state = accumulator
         .function_calls_by_call_id
-        .entry(done_event.call_id.clone())
+        .entry(function_call_id.clone())
         .or_default();
+    state.provider_call_id = done_event
+        .call_id
+        .clone()
+        .or(state.provider_call_id.clone());
+    state.output_item_id = done_event.item_id.clone().or(state.output_item_id.clone());
     state.name = Some(done_event.name.clone());
     let final_arguments = if done_event.arguments.is_empty() {
         state.arguments.clone()
@@ -889,16 +938,142 @@ fn finalize_streamed_function_call(
         done_event.arguments.clone()
     };
     state.arguments = final_arguments.clone();
-    accumulator
-        .emitted_function_call_ids
-        .push(done_event.call_id.clone());
 
-    Ok(ParsedFunctionCall {
-        name: done_event.name,
-        call_id: done_event.call_id,
-        arguments: serde_json::from_str(&final_arguments)
-            .context("Failed to parse streamed function call arguments")?,
-    })
+    maybe_emit_streamed_function_call(accumulator, &function_call_id, false)
+}
+
+/// Uses `response.output_item.done` to enrich streamed function call metadata with authoritative IDs.
+fn handle_streamed_output_item_done(
+    accumulator: &mut StreamingResponsesAccumulator,
+    item: ResponsesOutputItem,
+) -> anyhow::Result<Option<ParsedFunctionCall>> {
+    if item.item_type != "function_call" {
+        return Ok(None);
+    }
+
+    let function_call_id = reconcile_streamed_function_call_state_key(
+        accumulator,
+        item.call_id.as_deref(),
+        item.id.as_deref(),
+    )?;
+    let state = accumulator
+        .function_calls_by_call_id
+        .entry(function_call_id.clone())
+        .or_default();
+    state.provider_call_id = item.call_id.clone().or(state.provider_call_id.clone());
+    state.output_item_id = item.id.clone().or(state.output_item_id.clone());
+    state.name = item.name.clone().or(state.name.clone());
+    if state.arguments.is_empty() {
+        state.arguments = item.arguments.clone().unwrap_or_default();
+    }
+
+    maybe_emit_streamed_function_call(accumulator, &function_call_id, true)
+}
+
+/// Emits a completed streamed function call once its metadata is sufficiently populated.
+fn maybe_emit_streamed_function_call(
+    accumulator: &mut StreamingResponsesAccumulator,
+    function_call_id: &str,
+    allow_item_id_fallback: bool,
+) -> anyhow::Result<Option<ParsedFunctionCall>> {
+    let state = accumulator
+        .function_calls_by_call_id
+        .get_mut(function_call_id)
+        .ok_or_else(|| anyhow!("Missing streamed function call state for id {function_call_id}"))?;
+    if state.emitted {
+        return Ok(None);
+    }
+
+    let name = state
+        .name
+        .clone()
+        .ok_or_else(|| anyhow!("Missing streamed function call name for id {function_call_id}"))?;
+    let Some(canonical_call_id) = state.provider_call_id.clone().or_else(|| {
+        allow_item_id_fallback
+            .then(|| state.output_item_id.clone())
+            .flatten()
+    }) else {
+        return Ok(None);
+    };
+    let arguments = if state.arguments.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(&state.arguments)
+            .context("Failed to parse streamed function call arguments")?
+    };
+
+    state.emitted = true;
+    if !accumulator
+        .emitted_function_call_ids
+        .iter()
+        .any(|existing_id| existing_id == function_call_id)
+    {
+        accumulator
+            .emitted_function_call_ids
+            .push(function_call_id.to_string());
+    }
+
+    Ok(Some(ParsedFunctionCall {
+        name,
+        call_id: canonical_call_id,
+        arguments,
+    }))
+}
+
+/// Reconciles a streamed function call state key, promoting item_id-backed state to a real call_id when available.
+fn reconcile_streamed_function_call_state_key(
+    accumulator: &mut StreamingResponsesAccumulator,
+    call_id: Option<&str>,
+    item_id: Option<&str>,
+) -> anyhow::Result<String> {
+    let Some(resolved_key) = call_id.or(item_id).filter(|value| !value.is_empty()) else {
+        return Err(anyhow!(
+            "Streaming function call event did not include either call_id or item_id"
+        ));
+    };
+
+    if let (Some(call_id), Some(item_id)) = (
+        call_id.filter(|value| !value.is_empty()),
+        item_id.filter(|value| !value.is_empty()),
+    ) {
+        if call_id != item_id {
+            let existing_call_state = accumulator.function_calls_by_call_id.remove(item_id);
+            let merged_state = merge_streaming_function_call_state(
+                existing_call_state,
+                accumulator.function_calls_by_call_id.remove(call_id),
+            );
+            if let Some(merged_state) = merged_state {
+                accumulator
+                    .function_calls_by_call_id
+                    .insert(call_id.to_string(), merged_state);
+            }
+            return Ok(call_id.to_string());
+        }
+    }
+
+    Ok(resolved_key.to_string())
+}
+
+/// Merges two streamed function call states, preferring the more authoritative populated fields.
+fn merge_streaming_function_call_state(
+    first: Option<StreamingFunctionCallState>,
+    second: Option<StreamingFunctionCallState>,
+) -> Option<StreamingFunctionCallState> {
+    match (first, second) {
+        (None, None) => None,
+        (Some(state), None) | (None, Some(state)) => Some(state),
+        (Some(first), Some(second)) => Some(StreamingFunctionCallState {
+            output_item_id: second.output_item_id.or(first.output_item_id),
+            provider_call_id: second.provider_call_id.or(first.provider_call_id),
+            name: second.name.or(first.name),
+            arguments: if second.arguments.is_empty() {
+                first.arguments
+            } else {
+                second.arguments
+            },
+            emitted: first.emitted || second.emitted,
+        }),
+    }
 }
 
 /// Finalizes stream state, backfills any non-streamed outputs, and records conversation history.
@@ -1110,6 +1285,25 @@ fn streamed_error_message(payload: &Value) -> String {
     }
 
     payload.to_string()
+}
+
+/// Resolves the function call identifier from a streamed Responses event.
+fn streamed_function_call_id(
+    call_id: Option<&str>,
+    item_id: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(call_id) = call_id.filter(|value| !value.is_empty()) {
+        return Ok(call_id.to_string());
+    }
+
+    if let Some(item_id) = item_id.filter(|value| !value.is_empty()) {
+        log::debug!("Streaming Responses event omitted call_id, falling back to item_id");
+        return Ok(item_id.to_string());
+    }
+
+    Err(anyhow!(
+        "Streaming function call event did not include either call_id or item_id"
+    ))
 }
 
 /// Converts a parsed Responses function call into a Warp tool call message.
@@ -2231,6 +2425,80 @@ mod tests {
         conversation_state_store()
             .lock()
             .remove(&params.conversation_id);
+    }
+
+    /// Verifies that streamed function calls wait for output_item metadata when call_id is missing.
+    #[test]
+    fn streamed_function_calls_use_output_item_done_to_get_real_call_id() {
+        let mut accumulator = StreamingResponsesAccumulator::default();
+        accumulator
+            .function_calls_by_call_id
+            .entry("item_123".to_string())
+            .or_default()
+            .arguments
+            .push_str(r#"{"path":"."}"#);
+
+        let function_call = finalize_streamed_function_call(
+            &mut accumulator,
+            ResponsesFunctionCallArgumentsDoneEvent {
+                call_id: None,
+                item_id: Some("item_123".to_string()),
+                name: "file_glob".to_string(),
+                arguments: String::new(),
+            },
+        )
+        .expect("missing call_id should not error");
+        assert!(function_call.is_none());
+
+        let function_call = handle_streamed_output_item_done(
+            &mut accumulator,
+            ResponsesOutputItem {
+                id: Some("item_123".to_string()),
+                item_type: "function_call".to_string(),
+                role: None,
+                content: vec![],
+                name: Some("file_glob".to_string()),
+                call_id: Some("call_real_123".to_string()),
+                arguments: Some(r#"{"path":"."}"#.to_string()),
+            },
+        )
+        .expect("output_item.done should not error")
+        .expect("output_item.done should emit the completed tool call");
+
+        assert_eq!(function_call.call_id, "call_real_123");
+        assert_eq!(function_call.name, "file_glob");
+        assert_eq!(function_call.arguments["path"], ".");
+    }
+
+    /// Verifies that streamed function calls can still fall back to item_id from output_item metadata.
+    #[test]
+    fn streamed_function_calls_fall_back_to_item_id_when_output_item_has_no_call_id() {
+        let mut accumulator = StreamingResponsesAccumulator::default();
+        accumulator
+            .function_calls_by_call_id
+            .entry("item_123".to_string())
+            .or_default()
+            .arguments
+            .push_str(r#"{"path":"."}"#);
+
+        let function_call = handle_streamed_output_item_done(
+            &mut accumulator,
+            ResponsesOutputItem {
+                id: Some("item_123".to_string()),
+                item_type: "function_call".to_string(),
+                role: None,
+                content: vec![],
+                name: Some("file_glob".to_string()),
+                call_id: None,
+                arguments: Some(r#"{"path":"."}"#.to_string()),
+            },
+        )
+        .expect("output_item.done should not error")
+        .expect("output_item.done should emit the completed tool call");
+
+        assert_eq!(function_call.call_id, "item_123");
+        assert_eq!(function_call.name, "file_glob");
+        assert_eq!(function_call.arguments["path"], ".");
     }
 
     /// Verifies that tools with optional parameters are exposed with strict mode disabled.
