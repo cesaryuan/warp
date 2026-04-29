@@ -1,12 +1,14 @@
 //! Request-building helpers for the local OpenAI-compatible Responses backend.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::anyhow;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde_json::{json, Value};
+use warp_multi_agent_api as api;
 
 use crate::ai::agent::{AIAgentContext, AIAgentInput, MCPContext, MCPServer};
+use crate::ai::agent::api::user_inputs_from_messages;
 use crate::server::server_api::ServerApi;
 
 use super::tool_schemas::built_in_tool_schema;
@@ -299,12 +301,24 @@ fn function_call_output_item(call_id: String, output: String) -> Value {
 
 /// Builds the list of tool definitions exposed to the local Responses model.
 pub(super) fn build_tools_payload(params: &RequestParams) -> Vec<Value> {
-    let mut tools = get_supported_tools(params)
+    let requested_tools = requested_local_tool_types(params);
+    let supports_mcp_tools = requested_tools.contains(&api::ToolType::CallMcpTool);
+    let mut tools = requested_tools
         .into_iter()
         .filter_map(built_in_tool_schema)
         .collect::<Vec<_>>();
-    tools.extend(mcp_tool_schemas(params.mcp_context.as_ref()));
+    if supports_mcp_tools {
+        tools.extend(mcp_tool_schemas(params.mcp_context.as_ref()));
+    }
     tools
+}
+
+/// Returns the tool set the local backend should expose after applying request overrides.
+fn requested_local_tool_types(params: &RequestParams) -> Vec<api::ToolType> {
+    params
+        .supported_tools_override
+        .clone()
+        .unwrap_or_else(|| get_supported_tools(params))
 }
 
 /// Converts MCP tool metadata already present in the request context into OpenAI function schemas.

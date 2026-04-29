@@ -260,6 +260,27 @@ fn build_tools_payload_includes_mcp_tools() {
     }));
 }
 
+/// Verifies that supported-tools overrides are respected when building local tool payloads.
+#[test]
+fn build_tools_payload_respects_supported_tools_override() {
+    let mut params = request_params_for_local_backend_tests();
+    params.supported_tools_override = Some(vec![api::ToolType::SuggestPrompt]);
+
+    let payload = build_tools_payload(&params);
+    assert_eq!(payload.len(), 1);
+    assert_eq!(payload[0]["name"], "suggest_prompt");
+}
+
+/// Verifies that unsupported override tools are omitted rather than silently broadening the payload.
+#[test]
+fn build_tools_payload_omits_unsupported_override_tools() {
+    let mut params = request_params_for_local_backend_tests();
+    params.supported_tools_override = Some(vec![api::ToolType::Subagent]);
+
+    let payload = build_tools_payload(&params);
+    assert!(payload.is_empty());
+}
+
 /// Verifies that built-in tool schemas now carry parameter descriptions.
 #[test]
 fn built_in_tool_schemas_include_property_descriptions() {
