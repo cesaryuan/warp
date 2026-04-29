@@ -1,10 +1,13 @@
 //! Local OpenAI-compatible Responses API backend for Warp Agent.
 
+mod tool_schemas;
+
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, Context as _};
 use async_stream::stream;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures::channel::oneshot;
 use futures::future::{select, Either};
 use parking_lot::FairMutex;
@@ -15,11 +18,12 @@ use warp_multi_agent_api as api;
 
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::task::TaskId;
-use crate::ai::agent::{AIAgentContext, AIAgentInput};
+use crate::ai::agent::{AIAgentContext, AIAgentInput, MCPContext, MCPServer};
 use crate::server::server_api::ServerApi;
 
 use super::{Event, RequestParams, ResponseStream};
 use crate::ai::agent::api::r#impl::get_supported_tools;
+use tool_schemas::built_in_tool_schema;
 
 /// Minimal system instructions that teach a local Responses model how to behave like Warp Agent.
 const LOCAL_OPENAI_SYSTEM_PROMPT: &str = concat!(
@@ -504,220 +508,82 @@ fn function_call_output_item(call_id: String, output: String) -> Value {
 
 /// Builds the list of tool definitions exposed to the local Responses model.
 fn build_tools_payload(params: &RequestParams) -> Vec<Value> {
-    get_supported_tools(params)
+    let mut tools = get_supported_tools(params)
         .into_iter()
-        .filter_map(tool_schema_for_type)
+        .filter_map(built_in_tool_schema)
+        .collect::<Vec<_>>();
+    tools.extend(mcp_tool_schemas(params.mcp_context.as_ref()));
+    tools
+}
+
+/// Converts MCP tool metadata already present in the request context into OpenAI function schemas.
+fn mcp_tool_schemas(mcp_context: Option<&MCPContext>) -> Vec<Value> {
+    let Some(mcp_context) = mcp_context else {
+        return Vec::new();
+    };
+
+    if !mcp_context.servers.is_empty() {
+        return mcp_context
+            .servers
+            .iter()
+            .flat_map(mcp_server_tool_schemas)
+            .collect();
+    }
+
+    #[allow(deprecated)]
+    mcp_context
+        .tools
+        .iter()
+        .filter_map(|tool| mcp_tool_schema(None, tool))
         .collect()
 }
 
-/// Maps a supported Warp tool to a Responses function schema.
-fn tool_schema_for_type(tool_type: api::ToolType) -> Option<Value> {
-    match tool_type {
-        api::ToolType::RunShellCommand => Some(json!({
-            "name": "run_shell_command",
-            "description": "Run a shell command in the user's workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string" },
-                    "is_read_only": { "type": "boolean" },
-                    "wait_until_complete": { "type": "boolean" }
-                },
-                "required": ["command"]
-            }
-        })),
-        api::ToolType::ReadFiles => Some(json!({
-            "name": "read_files",
-            "description": "Read one or more files from the workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "files": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": { "type": "string" },
-                                "start_line": { "type": "integer" },
-                                "end_line": { "type": "integer" }
-                            },
-                            "required": ["name"]
-                        }
-                    }
-                },
-                "required": ["files"]
-            }
-        })),
-        api::ToolType::SearchCodebase => Some(json!({
-            "name": "search_codebase",
-            "description": "Search the indexed codebase for relevant files.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" },
-                    "path_filters": { "type": "array", "items": { "type": "string" } },
-                    "codebase_path": { "type": "string" }
-                },
-                "required": ["query"]
-            }
-        })),
-        api::ToolType::Grep => Some(json!({
-            "name": "grep",
-            "description": "Run grep-like text searches in the workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "queries": { "type": "array", "items": { "type": "string" } },
-                    "path": { "type": "string" }
-                },
-                "required": ["queries", "path"]
-            }
-        })),
-        api::ToolType::FileGlob => Some(json!({
-            "name": "file_glob",
-            "description": "Find files by glob pattern.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "patterns": { "type": "array", "items": { "type": "string" } },
-                    "path": { "type": "string" }
-                },
-                "required": ["patterns"]
-            }
-        })),
-        api::ToolType::FileGlobV2 => Some(json!({
-            "name": "file_glob_v2",
-            "description": "Find files by glob pattern with directory controls.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "patterns": { "type": "array", "items": { "type": "string" } },
-                    "search_dir": { "type": "string" },
-                    "max_matches": { "type": "integer" },
-                    "max_depth": { "type": "integer" },
-                    "min_depth": { "type": "integer" }
-                },
-                "required": ["patterns"]
-            }
-        })),
-        api::ToolType::ApplyFileDiffs => Some(json!({
-            "name": "apply_file_diffs",
-            "description": "Create, edit, move, or delete files in the workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "summary": { "type": "string" },
-                    "diffs": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "file_path": { "type": "string" },
-                                "search": { "type": "string" },
-                                "replace": { "type": "string" }
-                            },
-                            "required": ["file_path", "search", "replace"]
-                        }
-                    },
-                    "new_files": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "file_path": { "type": "string" },
-                                "content": { "type": "string" }
-                            },
-                            "required": ["file_path", "content"]
-                        }
-                    },
-                    "deleted_files": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "file_path": { "type": "string" }
-                            },
-                            "required": ["file_path"]
-                        }
-                    },
-                    "v4a_updates": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "file_path": { "type": "string" },
-                                "move_to": { "type": "string" },
-                                "hunks": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "change_context": { "type": "array", "items": { "type": "string" } },
-                                            "pre_context": { "type": "string" },
-                                            "old": { "type": "string" },
-                                            "new": { "type": "string" },
-                                            "post_context": { "type": "string" }
-                                        }
-                                    }
-                                }
-                            },
-                            "required": ["file_path", "hunks"]
-                        }
-                    }
-                }
-            }
-        })),
-        api::ToolType::ReadMcpResource => Some(json!({
-            "name": "read_mcp_resource",
-            "description": "Read a resource exposed by an MCP server.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "uri": { "type": "string" },
-                    "server_id": { "type": "string" }
-                },
-                "required": ["uri"]
-            }
-        })),
-        api::ToolType::CallMcpTool => Some(json!({
-            "name": "call_mcp_tool",
-            "description": "Call a tool exposed by an MCP server.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" },
-                    "args": { "type": "object" },
-                    "server_id": { "type": "string" }
-                },
-                "required": ["name", "args"]
-            }
-        })),
-        api::ToolType::WriteToLongRunningShellCommand => Some(json!({
-            "name": "write_to_long_running_shell_command",
-            "description": "Send input to a running shell command.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command_id": { "type": "string" },
-                    "input": { "type": "string" },
-                    "mode": { "type": "string", "enum": ["raw", "line", "block"] }
-                },
-                "required": ["command_id", "input"]
-            }
-        })),
-        api::ToolType::SuggestNewConversation => Some(json!({
-            "name": "suggest_new_conversation",
-            "description": "Suggest starting a new conversation from a specific message.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "message_id": { "type": "string" }
-                },
-                "required": ["message_id"]
-            }
-        })),
-        _ => None,
-    }
+/// Converts every tool for a grouped MCP server into OpenAI function schemas.
+fn mcp_server_tool_schemas(server: &MCPServer) -> Vec<Value> {
+    server
+        .tools
+        .iter()
+        .filter_map(|tool| mcp_tool_schema(Some(server.id.as_str()), tool))
+        .collect()
+}
+
+/// Converts a single MCP tool into an OpenAI function schema using the server-provided JSON Schema.
+fn mcp_tool_schema(server_id: Option<&str>, tool: &rmcp::model::Tool) -> Option<Value> {
+    let input_schema = Value::Object(tool.input_schema.as_ref().clone());
+    let description = tool
+        .description
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| tool.title.clone())
+        .unwrap_or_else(|| format!("Call MCP tool '{}'.", tool.name));
+
+    Some(json!({
+        "type": "function",
+        "name": mcp_function_name(server_id, tool.name.as_ref()),
+        "description": description,
+        "parameters": input_schema,
+        "strict": false,
+    }))
+}
+
+/// Encodes a unique OpenAI function name for an MCP tool.
+fn mcp_function_name(server_id: Option<&str>, tool_name: &str) -> String {
+    let encoded_server_id = URL_SAFE_NO_PAD.encode(server_id.unwrap_or_default());
+    let encoded_tool_name = URL_SAFE_NO_PAD.encode(tool_name);
+    format!("warp_mcp_tool__{encoded_server_id}__{encoded_tool_name}")
+}
+
+/// Decodes a synthetic MCP tool function name back into its server ID and tool name.
+fn parse_mcp_function_name(name: &str) -> Option<(Option<String>, String)> {
+    let suffix = name.strip_prefix("warp_mcp_tool__")?;
+    let (encoded_server_id, encoded_tool_name) = suffix.split_once("__")?;
+    let server_id = URL_SAFE_NO_PAD.decode(encoded_server_id).ok()?;
+    let tool_name = URL_SAFE_NO_PAD.decode(encoded_tool_name).ok()?;
+
+    let server_id = String::from_utf8(server_id).ok()?;
+    let tool_name = String::from_utf8(tool_name).ok()?;
+
+    Some(((!server_id.is_empty()).then_some(server_id), tool_name))
 }
 
 /// Parses the assistant output returned by the Responses API into text and tool calls.
@@ -813,6 +679,19 @@ fn agent_output_message(task_id: &TaskId, request_id: &str, text: String) -> api
 #[allow(deprecated)]
 /// Converts a function tool name plus JSON arguments into the corresponding Warp tool call variant.
 fn parse_tool_call(name: &str, arguments: Value) -> anyhow::Result<api::message::tool_call::Tool> {
+    if let Some((server_id, tool_name)) = parse_mcp_function_name(name) {
+        return Ok(api::message::tool_call::Tool::CallMcpTool(
+            api::message::tool_call::CallMcpTool {
+                name: tool_name,
+                args: optional_object(&arguments, "args")
+                    .or_else(|| arguments.as_object().cloned())
+                    .map(serde_json_object_to_prost_struct)
+                    .transpose()?,
+                server_id: server_id.unwrap_or_default(),
+            },
+        ));
+    }
+
     match name {
         "run_shell_command" | "shell" => Ok(api::message::tool_call::Tool::RunShellCommand(
             api::message::tool_call::RunShellCommand {
@@ -836,7 +715,10 @@ fn parse_tool_call(name: &str, arguments: Value) -> anyhow::Result<api::message:
                     .map(
                         api::message::tool_call::run_shell_command::WaitUntilCompleteValue::WaitUntilComplete,
                     ),
-                risk_category: api::RiskCategory::Unspecified.into(),
+                risk_category: optional_string(&arguments, "risk_category")
+                    .and_then(|value| parse_risk_category(&value))
+                    .unwrap_or(api::RiskCategory::Unspecified)
+                    .into(),
             },
         )),
         "read_files" => Ok(api::message::tool_call::Tool::ReadFiles(
@@ -900,10 +782,57 @@ fn parse_tool_call(name: &str, arguments: Value) -> anyhow::Result<api::message:
                 },
             ))
         }
+        "read_shell_command_output" => Ok(api::message::tool_call::Tool::ReadShellCommandOutput(
+            api::message::tool_call::ReadShellCommandOutput {
+                command_id: required_string(&arguments, "command_id")?,
+                delay: parse_read_shell_command_output_delay(&arguments)?,
+            },
+        )),
         "suggest_new_conversation" => Ok(api::message::tool_call::Tool::SuggestNewConversation(
             api::message::tool_call::SuggestNewConversation {
                 message_id: required_string(&arguments, "message_id")?,
             },
+        )),
+        "read_documents" => Ok(api::message::tool_call::Tool::ReadDocuments(
+            api::message::tool_call::ReadDocuments {
+                documents: required_array(&arguments, "documents")?
+                    .iter()
+                    .map(parse_read_document)
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            },
+        )),
+        "edit_documents" => Ok(api::message::tool_call::Tool::EditDocuments(
+            api::message::tool_call::EditDocuments {
+                diffs: required_array(&arguments, "diffs")?
+                    .iter()
+                    .map(parse_document_diff)
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            },
+        )),
+        "create_documents" => Ok(api::message::tool_call::Tool::CreateDocuments(
+            api::message::tool_call::CreateDocuments {
+                new_documents: required_array(&arguments, "new_documents")?
+                    .iter()
+                    .map(parse_new_document)
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            },
+        )),
+        "suggest_prompt" => Ok(api::message::tool_call::Tool::SuggestPrompt(
+            parse_suggest_prompt(arguments)?,
+        )),
+        "open_code_review" => Ok(api::message::tool_call::Tool::OpenCodeReview(
+            api::message::tool_call::OpenCodeReview {},
+        )),
+        "init_project" => Ok(api::message::tool_call::Tool::InitProject(
+            api::message::tool_call::InitProject {},
+        )),
+        "fetch_conversation" => Ok(api::message::tool_call::Tool::FetchConversation(
+            api::message::tool_call::FetchConversation {
+                conversation_id: optional_string(&arguments, "conversation_id").unwrap_or_default(),
+            },
+        )),
+        "read_skill" => Ok(api::message::tool_call::Tool::ReadSkill(
+            parse_read_skill(arguments)?,
         )),
         unsupported => Err(anyhow!("Unsupported local OpenAI tool call: {unsupported}")),
     }
@@ -912,15 +841,40 @@ fn parse_tool_call(name: &str, arguments: Value) -> anyhow::Result<api::message:
 /// Parses the file arguments used by the `read_files` tool.
 fn parse_read_file(value: &Value) -> anyhow::Result<api::message::tool_call::read_files::File> {
     let name = required_string(value, "name")?;
-    let mut line_ranges = Vec::new();
-    if let (Some(start), Some(end)) = (
-        optional_u32(value, "start_line"),
-        optional_u32(value, "end_line"),
-    ) {
-        line_ranges.push(api::FileContentLineRange { start, end });
-    }
+    let line_ranges = parse_line_ranges(value, "line_ranges")?;
 
     Ok(api::message::tool_call::read_files::File { name, line_ranges })
+}
+
+/// Parses the document arguments used by the `read_documents` tool.
+fn parse_read_document(
+    value: &Value,
+) -> anyhow::Result<api::message::tool_call::read_documents::Document> {
+    Ok(api::message::tool_call::read_documents::Document {
+        document_id: required_string(value, "document_id")?,
+        line_ranges: parse_line_ranges(value, "line_ranges")?,
+    })
+}
+
+/// Parses a single document diff entry for `edit_documents`.
+fn parse_document_diff(
+    value: &Value,
+) -> anyhow::Result<api::message::tool_call::edit_documents::DocumentDiff> {
+    Ok(api::message::tool_call::edit_documents::DocumentDiff {
+        document_id: required_string(value, "document_id")?,
+        search: required_string(value, "search")?,
+        replace: required_string(value, "replace")?,
+    })
+}
+
+/// Parses a single new document entry for `create_documents`.
+fn parse_new_document(
+    value: &Value,
+) -> anyhow::Result<api::message::tool_call::create_documents::NewDocument> {
+    Ok(api::message::tool_call::create_documents::NewDocument {
+        content: required_string(value, "content")?,
+        title: optional_string(value, "title").unwrap_or_default(),
+    })
 }
 
 /// Parses the complex `apply_file_diffs` argument payload.
@@ -998,6 +952,31 @@ fn parse_v4a_update(
     })
 }
 
+/// Parses the optional line ranges used by read_files and read_documents.
+fn parse_line_ranges(value: &Value, key: &str) -> anyhow::Result<Vec<api::FileContentLineRange>> {
+    if let Some(line_ranges) = optional_array(value, key) {
+        return line_ranges
+            .iter()
+            .map(|value| {
+                Ok(api::FileContentLineRange {
+                    start: required_u32(value, "start")?,
+                    end: required_u32(value, "end")?,
+                })
+            })
+            .collect();
+    }
+
+    // Backwards-compatible fallback for the earlier start_line/end_line shape.
+    if let (Some(start), Some(end)) = (
+        optional_u32(value, "start_line"),
+        optional_u32(value, "end_line"),
+    ) {
+        return Ok(vec![api::FileContentLineRange { start, end }]);
+    }
+
+    Ok(Vec::new())
+}
+
 /// Parses the write mode used for long-running shell input.
 fn parse_write_mode(
     mode: String,
@@ -1018,6 +997,99 @@ fn parse_write_mode(
     };
 
     Ok(api::message::tool_call::write_to_long_running_shell_command::Mode { mode: Some(mode) })
+}
+
+/// Parses the optional delay configuration for `read_shell_command_output`.
+fn parse_read_shell_command_output_delay(
+    arguments: &Value,
+) -> anyhow::Result<Option<api::message::tool_call::read_shell_command_output::Delay>> {
+    if arguments
+        .get("on_completion")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(Some(
+            api::message::tool_call::read_shell_command_output::Delay::OnCompletion(()),
+        ));
+    }
+
+    if let Some(delay_seconds) = optional_i64(arguments, "delay_seconds") {
+        return Ok(Some(
+            api::message::tool_call::read_shell_command_output::Delay::Duration(
+                prost_types::Duration {
+                    seconds: delay_seconds,
+                    nanos: 0,
+                },
+            ),
+        ));
+    }
+
+    Ok(None)
+}
+
+/// Parses the prompt suggestion oneof shape into Warp's proto tool call.
+fn parse_suggest_prompt(
+    arguments: Value,
+) -> anyhow::Result<api::message::tool_call::SuggestPrompt> {
+    let display_mode = required_string(&arguments, "display_mode")?;
+    let display_mode = match display_mode.as_str() {
+        "inline_query_banner" => {
+            api::message::tool_call::suggest_prompt::DisplayMode::InlineQueryBanner(
+                api::message::tool_call::suggest_prompt::InlineQueryBanner {
+                    title: required_string(&arguments, "title")?,
+                    description: required_string(&arguments, "description")?,
+                    query: required_string(&arguments, "query")?,
+                },
+            )
+        }
+        "prompt_chip" => api::message::tool_call::suggest_prompt::DisplayMode::PromptChip(
+            api::message::tool_call::suggest_prompt::PromptChip {
+                prompt: required_string(&arguments, "prompt")?,
+                label: optional_string(&arguments, "label").unwrap_or_default(),
+            },
+        ),
+        _ => {
+            return Err(anyhow!(
+                "Unsupported suggest_prompt display_mode: {display_mode}"
+            ))
+        }
+    };
+
+    Ok(api::message::tool_call::SuggestPrompt {
+        display_mode: Some(display_mode),
+        is_trigger_irrelevant: arguments
+            .get("is_trigger_irrelevant")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// Parses the read_skill oneof shape into Warp's proto tool call.
+fn parse_read_skill(arguments: Value) -> anyhow::Result<api::message::tool_call::ReadSkill> {
+    let skill_reference = if let Some(skill_path) = optional_string(&arguments, "skill_path") {
+        Some(api::message::tool_call::read_skill::SkillReference::SkillPath(skill_path))
+    } else {
+        optional_string(&arguments, "bundled_skill_id")
+            .map(api::message::tool_call::read_skill::SkillReference::BundledSkillId)
+    };
+
+    Ok(api::message::tool_call::ReadSkill {
+        skill_reference,
+        name: optional_string(&arguments, "name").unwrap_or_default(),
+    })
+}
+
+/// Parses a string risk category into the protobuf enum.
+fn parse_risk_category(value: &str) -> Option<api::RiskCategory> {
+    match value {
+        "unspecified" => Some(api::RiskCategory::Unspecified),
+        "read_only" => Some(api::RiskCategory::ReadOnly),
+        "trivial_local_change" => Some(api::RiskCategory::TrivialLocalChange),
+        "nontrivial_local_change" => Some(api::RiskCategory::NontrivialLocalChange),
+        "external_change" => Some(api::RiskCategory::ExternalChange),
+        "risky" => Some(api::RiskCategory::Risky),
+        _ => None,
+    }
 }
 
 /// Converts a serde JSON object into a protobuf Struct for MCP tool arguments.
@@ -1130,6 +1202,20 @@ fn optional_i32(value: &Value, key: &str) -> Option<i32> {
         .get(key)
         .and_then(Value::as_i64)
         .and_then(|value| i32::try_from(value).ok())
+}
+
+/// Extracts a required `u32` field from a JSON object.
+fn required_u32(value: &Value, key: &str) -> anyhow::Result<u32> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| anyhow!("Missing required u32 field '{key}'"))
+}
+
+/// Extracts an optional `i64` field from a JSON object.
+fn optional_i64(value: &Value, key: &str) -> Option<i64> {
+    value.get(key).and_then(Value::as_i64)
 }
 
 /// Normalizes the user-provided base URL into the exact `/v1/responses` endpoint.
@@ -1333,6 +1419,9 @@ impl std::error::Error for ProviderError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
+    use std::sync::Arc;
+
     use crate::ai::agent::conversation::AIConversationId;
     use crate::ai::agent::task::TaskId;
     use crate::ai::agent::AIAgentActionResult;
@@ -1381,6 +1470,34 @@ mod tests {
             supported_tools_override: None,
             parent_agent_id: None,
             agent_name: None,
+        }
+    }
+
+    /// Builds a minimal MCP tool used for schema passthrough tests.
+    fn test_mcp_tool() -> rmcp::model::Tool {
+        rmcp::model::Tool {
+            name: Cow::Owned("lookup_weather".to_string()),
+            title: Some("Lookup Weather".to_string()),
+            description: Some(Cow::Owned("Look up weather by city.".to_string())),
+            input_schema: Arc::new(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "city": {
+                            "type": "string",
+                            "description": "City name to look up."
+                        }
+                    },
+                    "required": ["city"]
+                })
+                .as_object()
+                .expect("schema should be object")
+                .clone(),
+            ),
+            output_schema: None,
+            annotations: None,
+            icons: None,
+            meta: None,
         }
     }
 
@@ -1442,6 +1559,96 @@ mod tests {
         let (model, reasoning) = normalize_openai_model_and_reasoning("gpt-5-5");
         assert_eq!(model, "gpt-5.5");
         assert!(reasoning.is_none());
+    }
+
+    /// Verifies that MCP tool schemas reuse the server-provided description and JSON Schema.
+    #[test]
+    fn mcp_tool_schema_reuses_existing_metadata() {
+        let schema =
+            mcp_tool_schema(Some("server-1"), &test_mcp_tool()).expect("schema should exist");
+        assert_eq!(schema["type"], "function");
+        assert_eq!(schema["strict"], false);
+        assert_eq!(schema["description"], "Look up weather by city.");
+        assert_eq!(
+            schema["parameters"]["properties"]["city"]["description"],
+            "City name to look up."
+        );
+    }
+
+    /// Verifies that build_tools_payload merges built-in schemas with MCP tool schemas.
+    #[test]
+    fn build_tools_payload_includes_mcp_tools() {
+        let mut params = request_params_for_local_backend_tests();
+        params.mcp_context = Some(MCPContext {
+            #[allow(deprecated)]
+            resources: vec![],
+            #[allow(deprecated)]
+            tools: vec![],
+            servers: vec![MCPServer {
+                id: "server-1".to_string(),
+                name: "Test MCP".to_string(),
+                description: "Test server".to_string(),
+                resources: vec![],
+                tools: vec![test_mcp_tool()],
+            }],
+        });
+
+        let payload = build_tools_payload(&params);
+        assert!(payload.iter().any(|tool| {
+            tool["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("warp_mcp_tool__"))
+        }));
+    }
+
+    /// Verifies that built-in tool schemas now carry parameter descriptions.
+    #[test]
+    fn built_in_tool_schemas_include_property_descriptions() {
+        let payload = build_tools_payload(&request_params_for_local_backend_tests());
+        let run_shell_schema = payload
+            .iter()
+            .find(|tool| tool["name"] == "run_shell_command")
+            .expect("run_shell_command schema should be present");
+        assert_eq!(run_shell_schema["type"], "function");
+        assert_eq!(run_shell_schema["strict"], true);
+        assert!(
+            run_shell_schema["parameters"]["properties"]["command"]["description"]
+                .as_str()
+                .is_some()
+        );
+    }
+
+    /// Verifies that the run_shell_command schema exposes proto-backed risk fields.
+    #[test]
+    fn run_shell_command_schema_includes_proto_risk_fields() {
+        let payload = build_tools_payload(&request_params_for_local_backend_tests());
+        let run_shell_schema = payload
+            .iter()
+            .find(|tool| tool["name"] == "run_shell_command")
+            .expect("run_shell_command schema should be present");
+        assert_eq!(
+            run_shell_schema["parameters"]["additionalProperties"],
+            serde_json::json!(false)
+        );
+        assert!(run_shell_schema["parameters"]["properties"]["uses_pager"].is_object());
+        assert!(run_shell_schema["parameters"]["properties"]["risk_category"].is_object());
+    }
+
+    /// Verifies that read_files parsing accepts the proto-shaped line_ranges field.
+    #[test]
+    fn parse_read_file_supports_line_ranges() {
+        let parsed = parse_read_file(&serde_json::json!({
+            "name": "README.md",
+            "line_ranges": [
+                { "start": 1, "end": 5 }
+            ]
+        }))
+        .expect("read_files payload should parse");
+
+        assert_eq!(parsed.name, "README.md");
+        assert_eq!(parsed.line_ranges.len(), 1);
+        assert_eq!(parsed.line_ranges[0].start, 1);
+        assert_eq!(parsed.line_ranges[0].end, 5);
     }
 
     /// Verifies that the local backend upgrades the optimistic task on the first turn.
