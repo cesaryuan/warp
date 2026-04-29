@@ -28,9 +28,9 @@ use crate::settings::{
     AgentModeCommandExecutionPredicate, AgentModeQuerySuggestionsEnabled, AwsBedrockAutoLogin,
     AwsBedrockCredentialsEnabled, CanUseWarpCreditsWithByok, CodeSettings, CodebaseContextEnabled,
     FileBasedMcpEnabled, GitOperationsAutogenEnabled, IncludeAgentCommandsInHistory,
-    IntelligentAutosuggestionsEnabled, MemoryEnabled, NLDInTerminalEnabled,
-    NaturalLanguageAutosuggestionsEnabled, OrchestrationEnabled, RuleSuggestionsEnabled,
-    SharedBlockTitleGenerationEnabled, ShouldRenderCLIAgentToolbar,
+    IntelligentAutosuggestionsEnabled, LocalOpenAIResponsesBackendEnabled, MemoryEnabled,
+    NLDInTerminalEnabled, NaturalLanguageAutosuggestionsEnabled, OrchestrationEnabled,
+    RuleSuggestionsEnabled, SharedBlockTitleGenerationEnabled, ShouldRenderCLIAgentToolbar,
     ShouldRenderUseAgentToolbarForUserCommands, ShouldShowOzUpdatesInZeroState, ShowAgentTips,
     ShowConversationHistory, ShowHintText, ThinkingDisplayMode, VoiceInputEnabled,
     WarpDriveContextEnabled,
@@ -2070,6 +2070,7 @@ pub enum AISettingsPageAction {
     ToggleUseAgentToolbar,
     ToggleVoiceInput,
     ToggleCanUseWarpCreditsWithByok,
+    ToggleLocalOpenAIResponsesBackendEnabled,
     HyperlinkClick(HyperlinkUrl),
     ToggleCodebaseContext,
     ToggleShowInputHintText,
@@ -2458,6 +2459,14 @@ impl TypedActionView for AISettingsPageView {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     report_if_error!(settings
                         .can_use_warp_credits_with_byok
+                        .toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
+            AISettingsPageAction::ToggleLocalOpenAIResponsesBackendEnabled => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings
+                        .local_openai_responses_backend_enabled
                         .toggle_and_save_value(ctx));
                 });
                 ctx.notify();
@@ -5966,14 +5975,48 @@ impl SettingsWidget for CloudAgentComputerUseWidget {
 
 struct ApiKeysWidget {
     openai_api_key_editor: ViewHandle<EditorView>,
+    openai_base_url_editor: ViewHandle<EditorView>,
     anthropic_api_key_editor: ViewHandle<EditorView>,
     google_api_key_editor: ViewHandle<EditorView>,
 
     can_use_warp_credits_with_byok: SwitchStateHandle,
+    local_openai_responses_backend_enabled: SwitchStateHandle,
     upgrade_highlight_index: HighlightedHyperlink,
 }
 
 impl ApiKeysWidget {
+    /// Builds a single-line editor used for API key and endpoint configuration.
+    fn create_api_value_editor(
+        initial_value: Option<&String>,
+        placeholder: &'static str,
+        is_password: bool,
+        ctx: &mut ViewContext<<Self as SettingsWidget>::View>,
+    ) -> ViewHandle<EditorView> {
+        ctx.add_typed_action_view(move |ctx| {
+            let appearance = Appearance::handle(ctx).as_ref(ctx);
+            let options = SingleLineEditorOptions {
+                is_password,
+                text: TextOptions {
+                    font_size_override: Some(appearance.ui_font_size()),
+                    font_family_override: Some(appearance.monospace_font_family()),
+                    text_colors_override: Some(TextColors {
+                        default_color: appearance.theme().active_ui_text_color(),
+                        disabled_color: appearance.theme().disabled_ui_text_color(),
+                        hint_color: appearance.theme().disabled_ui_text_color(),
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut editor = EditorView::single_line(options, ctx);
+            editor.set_placeholder_text(placeholder, ctx);
+            if let Some(value) = initial_value {
+                editor.set_buffer_text(value, ctx);
+            }
+            editor
+        })
+    }
+
     fn new(ctx: &mut ViewContext<<Self as SettingsWidget>::View>) -> Self {
         let ai_settings = AISettings::as_ref(ctx);
         let workspace_handle = UserWorkspaces::handle(ctx);
@@ -5982,6 +6025,7 @@ impl ApiKeysWidget {
 
         let ApiKeys {
             openai: openai_key,
+            openai_base_url,
             anthropic: anthropic_key,
             google: google_key,
             ..
@@ -5991,29 +6035,7 @@ impl ApiKeysWidget {
         // of code duplication and ensures consistency between the editors.
         macro_rules! create_api_key_editor {
             ($editor:ident, $key:ident, $set_func:ident, $placeholder:literal) => {
-                let $editor = ctx.add_typed_action_view(move |ctx| {
-                    let appearance = Appearance::handle(ctx).as_ref(ctx);
-                    let options = SingleLineEditorOptions {
-                        is_password: true,
-                        text: TextOptions {
-                            font_size_override: Some(appearance.ui_font_size()),
-                            font_family_override: Some(appearance.monospace_font_family()),
-                            text_colors_override: Some(TextColors {
-                                default_color: appearance.theme().active_ui_text_color(),
-                                disabled_color: appearance.theme().disabled_ui_text_color(),
-                                hint_color: appearance.theme().disabled_ui_text_color(),
-                            }),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    };
-                    let mut editor = EditorView::single_line(options, ctx);
-                    editor.set_placeholder_text($placeholder, ctx);
-                    if let Some(key) = &$key {
-                        editor.set_buffer_text(key, ctx);
-                    }
-                    editor
-                });
+                let $editor = Self::create_api_value_editor($key.as_ref(), $placeholder, true, ctx);
                 AISettingsPageView::update_editor_interaction_state(
                     $editor.clone(),
                     is_any_ai_enabled && is_byo_enabled,
@@ -6059,6 +6081,39 @@ impl ApiKeysWidget {
         }
 
         create_api_key_editor!(openai_api_key_editor, openai_key, set_openai_key, "sk-...");
+        let openai_base_url_editor = Self::create_api_value_editor(
+            openai_base_url.as_ref(),
+            "https://api.openai.com",
+            false,
+            ctx,
+        );
+        AISettingsPageView::update_editor_interaction_state(
+            openai_base_url_editor.clone(),
+            is_any_ai_enabled && is_byo_enabled,
+            ctx,
+        );
+        ctx.subscribe_to_view(&openai_base_url_editor, |_, editor, event, ctx| {
+            if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
+                let buffer_text = editor.as_ref(ctx).buffer_text(ctx);
+                let base_url = buffer_text.trim().is_empty().not().then_some(buffer_text);
+                ApiKeyManager::handle(ctx).update(ctx, |model, ctx| {
+                    model.set_openai_base_url(base_url, ctx);
+                });
+            }
+        });
+        let openai_base_url_editor_clone = openai_base_url_editor.clone();
+        ctx.subscribe_to_model(&workspace_handle, move |_, workspace, event, ctx| {
+            if let UserWorkspacesEvent::TeamsChanged = event {
+                let is_any_ai_enabled = AISettings::handle(ctx).as_ref(ctx).is_any_ai_enabled(ctx);
+                let is_byo_enabled = workspace.as_ref(ctx).is_byo_api_key_enabled();
+                AISettingsPageView::update_editor_interaction_state(
+                    openai_base_url_editor_clone.clone(),
+                    is_any_ai_enabled && is_byo_enabled,
+                    ctx,
+                );
+                ctx.notify();
+            }
+        });
         create_api_key_editor!(
             anthropic_api_key_editor,
             anthropic_key,
@@ -6072,12 +6127,46 @@ impl ApiKeysWidget {
             "AIzaSy..."
         );
 
+        let openai_api_key_editor_clone = openai_api_key_editor.clone();
+        let anthropic_api_key_editor_clone = anthropic_api_key_editor.clone();
+        let google_api_key_editor_clone = google_api_key_editor.clone();
+        let openai_base_url_editor_for_ai_toggle = openai_base_url_editor.clone();
+        ctx.subscribe_to_model(&AISettings::handle(ctx), move |_, _, event, ctx| {
+            if matches!(event, AISettingsChangedEvent::IsAnyAIEnabled { .. }) {
+                let is_enabled = AISettings::handle(ctx).as_ref(ctx).is_any_ai_enabled(ctx)
+                    && UserWorkspaces::as_ref(ctx).is_byo_api_key_enabled();
+                AISettingsPageView::update_editor_interaction_state(
+                    openai_api_key_editor_clone.clone(),
+                    is_enabled,
+                    ctx,
+                );
+                AISettingsPageView::update_editor_interaction_state(
+                    anthropic_api_key_editor_clone.clone(),
+                    is_enabled,
+                    ctx,
+                );
+                AISettingsPageView::update_editor_interaction_state(
+                    google_api_key_editor_clone.clone(),
+                    is_enabled,
+                    ctx,
+                );
+                AISettingsPageView::update_editor_interaction_state(
+                    openai_base_url_editor_for_ai_toggle.clone(),
+                    is_enabled,
+                    ctx,
+                );
+                ctx.notify();
+            }
+        });
+
         Self {
             openai_api_key_editor,
+            openai_base_url_editor,
             anthropic_api_key_editor,
             google_api_key_editor,
 
             can_use_warp_credits_with_byok: Default::default(),
+            local_openai_responses_backend_enabled: Default::default(),
             upgrade_highlight_index: Default::default(),
         }
     }
@@ -6148,6 +6237,13 @@ impl ApiKeysWidget {
             appearance,
             "OpenAI API Key",
             self.openai_api_key_editor.clone(),
+            is_enabled,
+            app,
+        ));
+        column.add_child(render_api_key_input(
+            appearance,
+            "OpenAI Base URL",
+            self.openai_base_url_editor.clone(),
             is_enabled,
             app,
         ));
@@ -6255,13 +6351,45 @@ impl ApiKeysWidget {
             .with_child(description)
             .finish()
     }
+
+    /// Renders the toggle that switches Warp Agent to the local OpenAI Responses backend.
+    fn render_local_openai_responses_backend_toggle(
+        &self,
+        view: &AISettingsPageView,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let ai_settings = AISettings::as_ref(app);
+        let is_enabled = ai_settings.is_any_ai_enabled(app)
+            && UserWorkspaces::as_ref(app).is_byo_api_key_enabled();
+
+        let toggle = render_ai_setting_toggle::<LocalOpenAIResponsesBackendEnabled>(
+            "Use local OpenAI-compatible backend",
+            AISettingsPageAction::ToggleLocalOpenAIResponsesBackendEnabled,
+            *ai_settings.local_openai_responses_backend_enabled,
+            is_enabled,
+            self.local_openai_responses_backend_enabled.clone(),
+            &view.local_only_icon_tooltip_states,
+            app,
+        );
+
+        let description = render_ai_setting_description(
+            "When enabled, Warp Agent requests go directly from this client to the configured OpenAI-compatible /v1/responses endpoint. Your OpenAI API key and request payload will not be sent to Warp's /ai/multi-agent service on this path.",
+            is_enabled,
+            app,
+        );
+
+        Flex::column()
+            .with_child(toggle)
+            .with_child(description)
+            .finish()
+    }
 }
 
 impl SettingsWidget for ApiKeysWidget {
     type View = AISettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "api keys bring your own byo openai anthropic google claude gemini gpt"
+        "api keys bring your own byo openai anthropic google claude gemini gpt base url responses local backend"
     }
 
     fn render(
@@ -6290,6 +6418,11 @@ impl SettingsWidget for ApiKeysWidget {
         if is_byo_enabled {
             column.add_child(
                 Container::new(self.render_can_use_warp_credits_with_byok_toggle(view, app))
+                    .with_margin_top(16.)
+                    .finish(),
+            );
+            column.add_child(
+                Container::new(self.render_local_openai_responses_backend_toggle(view, app))
                     .with_margin_top(16.)
                     .finish(),
             );
