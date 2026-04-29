@@ -912,12 +912,34 @@ fn finalize_stream_state(
 
     if let Some(response) = completed_response {
         let output = response.output;
-        let (assistant_messages, function_calls) = parse_responses_output(output.clone())?;
-        let mut history_items = assistant_messages
-            .iter()
-            .map(|text| assistant_output_item(text))
-            .collect::<Vec<_>>();
-        history_items.extend(function_calls.iter().map(function_call_history_item));
+        let history_items = if output.is_empty() {
+            history_items_from_accumulator(&accumulator)?
+        } else {
+            match parse_responses_output(output.clone()) {
+                Ok((assistant_messages, function_calls)) => {
+                    if assistant_messages.is_empty()
+                        && function_calls.is_empty()
+                        && has_streamed_output(&accumulator)
+                    {
+                        history_items_from_accumulator(&accumulator)?
+                    } else {
+                        let mut history_items = assistant_messages
+                            .iter()
+                            .map(|text| assistant_output_item(text))
+                            .collect::<Vec<_>>();
+                        history_items.extend(function_calls.iter().map(function_call_history_item));
+                        history_items
+                    }
+                }
+                Err(error) if has_streamed_output(&accumulator) => {
+                    log::debug!(
+                        "Falling back to streamed local Responses history because completed payload could not be parsed: {error:#}"
+                    );
+                    history_items_from_accumulator(&accumulator)?
+                }
+                Err(error) => return Err(error),
+            }
+        };
         if !history_items.is_empty() {
             let mut state_store = conversation_state_store().lock();
             let state = state_store.entry(params.conversation_id).or_default();
@@ -943,6 +965,50 @@ fn finalize_stream_state(
         ),
     )));
     Ok(events)
+}
+
+/// Returns whether the accumulator already captured streamed text or tool calls.
+fn has_streamed_output(accumulator: &StreamingResponsesAccumulator) -> bool {
+    !accumulator.text_messages_by_item_id.is_empty()
+        || !accumulator.emitted_function_call_ids.is_empty()
+}
+
+/// Reconstructs conversation history items from streamed deltas when the completed payload is empty.
+fn history_items_from_accumulator(
+    accumulator: &StreamingResponsesAccumulator,
+) -> anyhow::Result<Vec<Value>> {
+    let mut items = Vec::new();
+
+    for item_id in &accumulator.emitted_text_item_ids {
+        let Some(message_state) = accumulator.text_messages_by_item_id.get(item_id) else {
+            continue;
+        };
+        if !message_state.text.is_empty() {
+            items.push(assistant_output_item(&message_state.text));
+        }
+    }
+
+    for call_id in &accumulator.emitted_function_call_ids {
+        let Some(function_call_state) = accumulator.function_calls_by_call_id.get(call_id) else {
+            continue;
+        };
+        let Some(name) = function_call_state.name.clone() else {
+            continue;
+        };
+        let arguments = if function_call_state.arguments.is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&function_call_state.arguments)
+                .context("Failed to parse streamed function call arguments from accumulator")?
+        };
+        items.push(function_call_history_item(&ParsedFunctionCall {
+            name,
+            call_id: call_id.clone(),
+            arguments,
+        }));
+    }
+
+    Ok(items)
 }
 
 /// Builds fallback messages for any completed outputs that were not already streamed to the UI.
@@ -2124,6 +2190,47 @@ mod tests {
             panic!("expected agent output message");
         };
         assert_eq!(agent_output.text, "hello world");
+    }
+
+    /// Verifies that an empty completed payload does not fail if text was already streamed.
+    #[test]
+    fn finalize_stream_state_accepts_empty_completed_payload_after_streamed_text() {
+        let params = request_params_for_local_backend_tests();
+        conversation_state_store()
+            .lock()
+            .remove(&params.conversation_id);
+
+        let mut accumulator = StreamingResponsesAccumulator::default();
+        accumulator.emitted_text_item_ids.push("item-1".to_string());
+        accumulator.text_messages_by_item_id.insert(
+            "item-1".to_string(),
+            StreamingTextMessageState {
+                message_id: "message-1".to_string(),
+                text: "hello".to_string(),
+            },
+        );
+
+        let events = finalize_stream_state(
+            &params,
+            accumulator,
+            "request-id",
+            Some(ResponsesApiResponse { output: vec![] }),
+        )
+        .expect("empty completed payload should be accepted after streamed text");
+
+        assert_eq!(events.len(), 1);
+        let stored_items = conversation_state_store()
+            .lock()
+            .get(&params.conversation_id)
+            .cloned()
+            .expect("conversation state should exist")
+            .items;
+        assert_eq!(stored_items.len(), 1);
+        assert_eq!(stored_items[0]["content"][0]["text"], "hello");
+
+        conversation_state_store()
+            .lock()
+            .remove(&params.conversation_id);
     }
 
     /// Verifies that tools with optional parameters are exposed with strict mode disabled.
