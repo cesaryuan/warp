@@ -93,12 +93,20 @@ struct ParsedFunctionCall {
 
 /// Request body sent to the local OpenAI-compatible `/v1/responses` endpoint.
 #[derive(Debug, Serialize)]
-struct ResponsesRequestBody<'a> {
-    model: &'a str,
-    instructions: &'a str,
+struct ResponsesRequestBody {
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ResponsesReasoningConfig>,
+    instructions: &'static str,
     input: Vec<Value>,
     tools: Vec<Value>,
     tool_choice: &'static str,
+}
+
+/// Reasoning configuration supported by the Responses API.
+#[derive(Debug, Clone, Serialize)]
+struct ResponsesReasoningConfig {
+    effort: String,
 }
 
 /// Returns the global in-memory state used to preserve local conversation history.
@@ -207,8 +215,11 @@ async fn execute_local_responses_request(
             .get(&params.conversation_id)
             .cloned()
             .unwrap_or_default();
+        let (normalized_model, reasoning) =
+            normalize_openai_model_and_reasoning(&params.model.to_string());
         ResponsesRequestBody {
-            model: &params.model.to_string(),
+            model: normalized_model,
+            reasoning,
             instructions: LOCAL_OPENAI_SYSTEM_PROMPT,
             input: state.items,
             tools: build_tools_payload(params),
@@ -1127,6 +1138,44 @@ fn normalize_responses_endpoint(base_url: &str) -> String {
     }
 }
 
+/// Normalizes Warp-style OpenAI GPT numeric model IDs and extracts a Responses reasoning effort when present.
+fn normalize_openai_model_and_reasoning(
+    model_id: &str,
+) -> (String, Option<ResponsesReasoningConfig>) {
+    let parts = model_id.split('-').collect::<Vec<_>>();
+    if parts.len() == 4
+        && parts[0] == "gpt"
+        && parts[1].chars().all(|c| c.is_ascii_digit())
+        && parts[2].chars().all(|c| c.is_ascii_digit())
+        && is_supported_reasoning_effort(parts[3])
+    {
+        return (
+            format!("gpt-{}.{}", parts[1], parts[2]),
+            Some(ResponsesReasoningConfig {
+                effort: parts[3].to_string(),
+            }),
+        );
+    }
+
+    if parts.len() == 3
+        && parts[0] == "gpt"
+        && parts[1].chars().all(|c| c.is_ascii_digit())
+        && parts[2].chars().all(|c| c.is_ascii_digit())
+    {
+        return (format!("gpt-{}.{}", parts[1], parts[2]), None);
+    }
+
+    (model_id.to_string(), None)
+}
+
+/// Returns whether the provided suffix is a Responses reasoning effort we can forward directly.
+fn is_supported_reasoning_effort(value: &str) -> bool {
+    matches!(
+        value,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+    )
+}
+
 /// Builds the initial stream event for a local backend request.
 fn stream_init_event(conversation_id: String, request_id: String) -> api::ResponseEvent {
     api::ResponseEvent {
@@ -1271,6 +1320,48 @@ mod tests {
             normalize_responses_endpoint("https://example.com/v1/"),
             "https://example.com/v1/responses"
         );
+    }
+
+    /// Verifies that Warp-style GPT-5.4 reasoning variants are converted to Responses model plus effort.
+    #[test]
+    fn normalize_openai_model_and_reasoning_extracts_effort() {
+        let (model, reasoning) = normalize_openai_model_and_reasoning("gpt-5-4-low");
+        assert_eq!(model, "gpt-5.4");
+        assert_eq!(
+            reasoning
+                .as_ref()
+                .map(|reasoning| reasoning.effort.as_str()),
+            Some("low")
+        );
+    }
+
+    /// Verifies that Warp-style GPT-5.5 reasoning variants are converted to Responses model plus effort.
+    #[test]
+    fn normalize_openai_model_and_reasoning_extracts_effort_for_gpt_5_5() {
+        let (model, reasoning) = normalize_openai_model_and_reasoning("gpt-5-5-low");
+        assert_eq!(model, "gpt-5.5");
+        assert_eq!(
+            reasoning
+                .as_ref()
+                .map(|reasoning| reasoning.effort.as_str()),
+            Some("low")
+        );
+    }
+
+    /// Verifies that base GPT numeric variants are normalized without inventing a reasoning effort.
+    #[test]
+    fn normalize_openai_model_and_reasoning_preserves_base_variant() {
+        let (model, reasoning) = normalize_openai_model_and_reasoning("gpt-5-4");
+        assert_eq!(model, "gpt-5.4");
+        assert!(reasoning.is_none());
+    }
+
+    /// Verifies that base GPT-5.5 variants are normalized without inventing a reasoning effort.
+    #[test]
+    fn normalize_openai_model_and_reasoning_preserves_gpt_5_5_base_variant() {
+        let (model, reasoning) = normalize_openai_model_and_reasoning("gpt-5-5");
+        assert_eq!(model, "gpt-5.5");
+        assert!(reasoning.is_none());
     }
 
     /// Verifies that user queries and tool outputs map to Responses input items.
