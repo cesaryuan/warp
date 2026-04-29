@@ -1,4 +1,4 @@
-name: Sync Upstream Stable And Release Master
+name: Sync Upstream Stable And Release OSS From Master
 
 on:
   schedule:
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Sync upstream stable into master, or release the current master branch.
+        description: Sync upstream stable into master, or release the current master branch as OSS.
         required: true
         type: choice
         default: sync_upstream
@@ -127,11 +127,11 @@ jobs:
           git push origin HEAD:refs/heads/master
 
   create_release:
-    name: Create release from master
+    name: Create OSS release from master
     if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'release_current_master') }}
     uses: ./.github/workflows/create_release.yml
     with:
-      channel: stable
+      channel: oss
       source_ref: refs/heads/master
       build_linux: ${{ github.event_name == 'workflow_dispatch' && inputs.build_linux || false }}
       build_linux_arm: ${{ github.event_name == 'workflow_dispatch' && inputs.build_linux_arm || false }}
