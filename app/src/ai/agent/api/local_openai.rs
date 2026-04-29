@@ -168,7 +168,9 @@ struct ResponsesFunctionCallArgumentsDoneEvent {
     call_id: Option<String>,
     #[serde(default)]
     item_id: Option<String>,
-    name: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
     arguments: String,
 }
 
@@ -931,7 +933,7 @@ fn finalize_streamed_function_call(
         .clone()
         .or(state.provider_call_id.clone());
     state.output_item_id = done_event.item_id.clone().or(state.output_item_id.clone());
-    state.name = Some(done_event.name.clone());
+    state.name = done_event.name.clone().or(state.name.clone());
     let final_arguments = if done_event.arguments.is_empty() {
         state.arguments.clone()
     } else {
@@ -984,15 +986,22 @@ fn maybe_emit_streamed_function_call(
         return Ok(None);
     }
 
-    let name = state
-        .name
-        .clone()
-        .ok_or_else(|| anyhow!("Missing streamed function call name for id {function_call_id}"))?;
+    let Some(name) = state.name.clone() else {
+        log::debug!(
+            "Deferring streamed function call emission until name is available for id {}",
+            function_call_id
+        );
+        return Ok(None);
+    };
     let Some(canonical_call_id) = state.provider_call_id.clone().or_else(|| {
         allow_item_id_fallback
             .then(|| state.output_item_id.clone())
             .flatten()
     }) else {
+        log::debug!(
+            "Deferring streamed function call emission until call_id metadata is available for id {}",
+            function_call_id
+        );
         return Ok(None);
     };
     let arguments = if state.arguments.is_empty() {
@@ -2443,7 +2452,7 @@ mod tests {
             ResponsesFunctionCallArgumentsDoneEvent {
                 call_id: None,
                 item_id: Some("item_123".to_string()),
-                name: "file_glob".to_string(),
+                name: Some("file_glob".to_string()),
                 arguments: String::new(),
             },
         )
@@ -2466,6 +2475,49 @@ mod tests {
         .expect("output_item.done should emit the completed tool call");
 
         assert_eq!(function_call.call_id, "call_real_123");
+        assert_eq!(function_call.name, "file_glob");
+        assert_eq!(function_call.arguments["path"], ".");
+    }
+
+    /// Verifies that streamed function calls tolerate missing names until output_item metadata arrives.
+    #[test]
+    fn streamed_function_calls_wait_for_output_item_name() {
+        let mut accumulator = StreamingResponsesAccumulator::default();
+        accumulator
+            .function_calls_by_call_id
+            .entry("item_456".to_string())
+            .or_default()
+            .arguments
+            .push_str(r#"{"path":"."}"#);
+
+        let function_call = finalize_streamed_function_call(
+            &mut accumulator,
+            ResponsesFunctionCallArgumentsDoneEvent {
+                call_id: None,
+                item_id: Some("item_456".to_string()),
+                name: None,
+                arguments: String::new(),
+            },
+        )
+        .expect("missing name should not error");
+        assert!(function_call.is_none());
+
+        let function_call = handle_streamed_output_item_done(
+            &mut accumulator,
+            ResponsesOutputItem {
+                id: Some("item_456".to_string()),
+                item_type: "function_call".to_string(),
+                role: None,
+                content: vec![],
+                name: Some("file_glob".to_string()),
+                call_id: Some("call_real_456".to_string()),
+                arguments: Some(r#"{"path":"."}"#.to_string()),
+            },
+        )
+        .expect("output_item.done should not error")
+        .expect("output_item.done should emit the completed tool call");
+
+        assert_eq!(function_call.call_id, "call_real_456");
         assert_eq!(function_call.name, "file_glob");
         assert_eq!(function_call.arguments["path"], ".");
     }
