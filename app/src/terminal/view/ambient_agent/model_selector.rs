@@ -15,7 +15,7 @@ use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::Fill;
 
 use crate::ai::blocklist::agent_view::agent_input_footer::AgentInputButtonTheme;
-use crate::ai::llms::{LLMPreferences, LLMPreferencesEvent};
+use crate::ai::llms::{effective_disable_reason_for_model, LLMPreferences, LLMPreferencesEvent};
 use crate::editor::{
     EditorView, Event as EditorEvent, PropagateAndNoOpEscapeKey, PropagateAndNoOpNavigationKeys,
     SingleLineEditorOptions, TextOptions,
@@ -264,7 +264,7 @@ impl ModelSelector {
                         .with_padding_override(ITEM_VERTICAL_PADDING, MENU_HORIZONTAL_PADDING)
                         .with_override_hover_background_color(hover_background)
                         .with_on_select_action(ModelSelectorAction::SelectModel(llm.id.clone()))
-                        .with_disabled(llm.disable_reason.is_some()),
+                        .with_disabled(effective_disable_reason_for_model(llm, ctx).is_some()),
                 ))
             })
             .collect();

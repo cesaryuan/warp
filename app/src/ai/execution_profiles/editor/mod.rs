@@ -4,7 +4,10 @@ use crate::ai::execution_profiles::{
     profiles::{AIExecutionProfilesModel, AIExecutionProfilesModelEvent, ClientProfileId},
     AIExecutionProfile, ActionPermission, WriteToPtyPermission,
 };
-use crate::ai::llms::{DisableReason, LLMId, LLMInfo, LLMPreferences, LLMPreferencesEvent};
+use crate::ai::llms::{
+    effective_disable_reason_for_model, DisableReason, LLMId, LLMInfo, LLMPreferences,
+    LLMPreferencesEvent,
+};
 use crate::ai::paths::host_native_absolute_path;
 use crate::editor::InteractionState;
 use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions};
@@ -1044,9 +1047,12 @@ impl ExecutionProfileEditorView {
             let llm_prefs = llm_prefs.as_ref(ctx);
             let choices = get_choices(llm_prefs);
 
-            let has_upgrade_gated_models = choices
-                .iter()
-                .any(|llm| matches!(llm.disable_reason, Some(DisableReason::RequiresUpgrade)));
+            let has_upgrade_gated_models = choices.iter().any(|llm| {
+                matches!(
+                    effective_disable_reason_for_model(llm, ctx),
+                    Some(DisableReason::RequiresUpgrade)
+                )
+            });
 
             let items = available_model_menu_items(
                 choices,

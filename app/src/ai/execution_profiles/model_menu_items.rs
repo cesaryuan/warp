@@ -1,4 +1,7 @@
-use crate::ai::llms::{is_using_api_key_for_provider, DisableReason, LLMId, LLMInfo};
+use crate::ai::llms::{
+    effective_disable_reason_for_model, is_using_api_key_for_provider, DisableReason, LLMId,
+    LLMInfo,
+};
 use crate::menu::{MenuItem, MenuItemFields, MenuTooltipPosition};
 use itertools::Itertools;
 use std::sync::Arc;
@@ -126,11 +129,13 @@ fn make_item_fields<A: Action + Clone>(
         MenuItemFields::new(label).with_icon(provider_icon)
     };
 
+    let disable_reason = effective_disable_reason_for_model(llm, app);
+
     item = item
         .with_on_select_action(action(llm))
-        .with_disabled(llm.disable_reason.is_some());
+        .with_disabled(disable_reason.is_some());
 
-    if let Some(reason) = &llm.disable_reason {
+    if let Some(reason) = &disable_reason {
         item = item
             .with_tooltip(reason.tooltip_text())
             .with_tooltip_position(MenuTooltipPosition::Above);
