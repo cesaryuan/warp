@@ -58,7 +58,7 @@ pub(super) fn built_in_tool_schema(tool_type: api::ToolType) -> Option<Value> {
                 ],
                 ["command"],
             ),
-            true,
+            false,
         )),
         api::ToolType::ReadFiles => Some(function_schema(
             "read_files",
@@ -102,7 +102,7 @@ pub(super) fn built_in_tool_schema(tool_type: api::ToolType) -> Option<Value> {
                 )],
                 ["files"],
             ),
-            true,
+            false,
         )),
         api::ToolType::SearchCodebase => Some(function_schema(
             "search_codebase",
@@ -129,7 +129,7 @@ pub(super) fn built_in_tool_schema(tool_type: api::ToolType) -> Option<Value> {
                 ],
                 ["query"],
             ),
-            true,
+            false,
         )),
         api::ToolType::Grep => Some(function_schema(
             "grep",
@@ -175,7 +175,7 @@ pub(super) fn built_in_tool_schema(tool_type: api::ToolType) -> Option<Value> {
                 ],
                 ["patterns"],
             ),
-            true,
+            false,
         )),
         api::ToolType::FileGlobV2 => Some(function_schema(
             "file_glob_v2",
@@ -208,7 +208,7 @@ pub(super) fn built_in_tool_schema(tool_type: api::ToolType) -> Option<Value> {
                 ],
                 ["patterns"],
             ),
-            true,
+            false,
         )),
         api::ToolType::ApplyFileDiffs => Some(function_schema(
             "apply_file_diffs",
@@ -330,7 +330,7 @@ pub(super) fn built_in_tool_schema(tool_type: api::ToolType) -> Option<Value> {
                 ],
                 [],
             ),
-            true,
+            false,
         )),
         api::ToolType::ReadMcpResource => Some(function_schema(
             "read_mcp_resource",
@@ -348,7 +348,7 @@ pub(super) fn built_in_tool_schema(tool_type: api::ToolType) -> Option<Value> {
                 ],
                 ["uri"],
             ),
-            true,
+            false,
         )),
         api::ToolType::WriteToLongRunningShellCommand => Some(function_schema(
             "write_to_long_running_shell_command",
@@ -373,7 +373,7 @@ pub(super) fn built_in_tool_schema(tool_type: api::ToolType) -> Option<Value> {
                 ],
                 ["command_id", "input"],
             ),
-            true,
+            false,
         )),
         api::ToolType::ReadShellCommandOutput => Some(function_schema(
             "read_shell_command_output",
@@ -395,7 +395,7 @@ pub(super) fn built_in_tool_schema(tool_type: api::ToolType) -> Option<Value> {
                 ],
                 ["command_id"],
             ),
-            true,
+            false,
         )),
         api::ToolType::SuggestNewConversation => Some(function_schema(
             "suggest_new_conversation",
@@ -443,7 +443,7 @@ pub(super) fn built_in_tool_schema(tool_type: api::ToolType) -> Option<Value> {
                 )],
                 ["documents"],
             ),
-            true,
+            false,
         )),
         api::ToolType::EditDocuments => Some(function_schema(
             "edit_documents",
@@ -486,7 +486,7 @@ pub(super) fn built_in_tool_schema(tool_type: api::ToolType) -> Option<Value> {
                 )],
                 ["new_documents"],
             ),
-            true,
+            false,
         )),
         api::ToolType::SuggestPrompt => Some(function_schema(
             "suggest_prompt",
@@ -527,7 +527,7 @@ pub(super) fn built_in_tool_schema(tool_type: api::ToolType) -> Option<Value> {
                 ],
                 ["display_mode"],
             ),
-            true,
+            false,
         )),
         api::ToolType::OpenCodeReview => Some(function_schema(
             "open_code_review",
@@ -551,7 +551,7 @@ pub(super) fn built_in_tool_schema(tool_type: api::ToolType) -> Option<Value> {
                 )],
                 [],
             ),
-            true,
+            false,
         )),
         api::ToolType::ReadSkill => Some(function_schema(
             "read_skill",
@@ -573,7 +573,7 @@ pub(super) fn built_in_tool_schema(tool_type: api::ToolType) -> Option<Value> {
                 ],
                 [],
             ),
-            true,
+            false,
         )),
         // MCP tools are exposed through their own rich per-server schemas instead of this generic shell.
         api::ToolType::CallMcpTool => None,

@@ -1610,7 +1610,7 @@ mod tests {
             .find(|tool| tool["name"] == "run_shell_command")
             .expect("run_shell_command schema should be present");
         assert_eq!(run_shell_schema["type"], "function");
-        assert_eq!(run_shell_schema["strict"], true);
+        assert_eq!(run_shell_schema["strict"], false);
         assert!(
             run_shell_schema["parameters"]["properties"]["command"]["description"]
                 .as_str()
@@ -1632,6 +1632,23 @@ mod tests {
         );
         assert!(run_shell_schema["parameters"]["properties"]["uses_pager"].is_object());
         assert!(run_shell_schema["parameters"]["properties"]["risk_category"].is_object());
+    }
+
+    /// Verifies that tools with optional parameters are exposed with strict mode disabled.
+    #[test]
+    fn tools_with_optional_fields_disable_strict_mode() {
+        let payload = build_tools_payload(&request_params_for_local_backend_tests());
+        let file_glob_schema = payload
+            .iter()
+            .find(|tool| tool["name"] == "file_glob")
+            .expect("file_glob schema should be present");
+        let read_documents_schema = payload
+            .iter()
+            .find(|tool| tool["name"] == "read_documents")
+            .expect("read_documents schema should be present");
+
+        assert_eq!(file_glob_schema["strict"], false);
+        assert_eq!(read_documents_schema["strict"], false);
     }
 
     /// Verifies that read_files parsing accepts the proto-shaped line_ranges field.
