@@ -188,17 +188,11 @@ where
     let mut has_connected_once = false;
 
     loop {
-        // NOTE: `source.open_stream` is lazy for the SSE-backed source
-        // — `reqwest_eventsource::eventsource()` returns Ok before any
-        // TCP connect happens, deferring the actual connection until
-        // the stream is polled. We therefore must not treat an Ok here
-        // as confirmation of connectivity. `failures = 0`,
-        // `has_connected_once = true`, and the `Connected` driver-state
-        // notification all wait for the `AgentEventSourceItem::Open`
-        // event below, which is emitted only after the SSE handshake
-        // actually completes. Without this, a server outage caused
-        // every retry to be at the first backoff step (1s) forever
-        // because failures was reset between every attempt.
+        // `open_stream` is lazy for the SSE-backed source: the TCP
+        // connect happens when the stream is first polled, not when
+        // this returns Ok. Wait for the `AgentEventSourceItem::Open`
+        // event below before declaring connectivity, so a server
+        // outage doesn't reset `failures` between every retry.
         let mut stream = match source.open_stream(&config.run_ids, since_sequence).await {
             Ok(stream) => stream,
             Err(err) => {

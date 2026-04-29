@@ -14,7 +14,12 @@ use crate::terminal::input::message_bar::{Message, MessageItem};
 use crate::terminal::input::slash_commands::SlashCommandTrigger;
 use crate::util::bindings::keybinding_name_to_keystroke;
 use crate::{
-    ai::agent::conversation::AIConversationId,
+    ai::{
+        agent::conversation::AIConversationId,
+        blocklist::orchestration_event_streamer::{
+            register_agent_view_consumer, unregister_agent_view_consumer,
+        },
+    },
     terminal::{view::ambient_agent::AmbientAgentViewModel, TerminalModel},
     BlocklistAIHistoryModel,
 };
@@ -817,25 +822,10 @@ impl AgentViewController {
             });
         }
 
-        // Register this view as a consumer of orchestration events for the
-        // conversation. The streamer only opens an SSE if the conversation is
-        // a parent (has children registered) — registering early ensures we
-        // pick up SSE as soon as the first child is spawned.
-        if warp_core::features::FeatureFlag::OrchestrationV2.is_enabled() {
-            let view_id = self.terminal_view_id;
-            crate::ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::handle(
-                ctx,
-            )
-            .update(ctx, |streamer, ctx| {
-                streamer.register_consumer(
-                    conversation_id,
-                    crate::ai::blocklist::orchestration_event_streamer::ConsumerId::AgentView(
-                        view_id,
-                    ),
-                    ctx,
-                );
-            });
-        }
+        // Register early; the streamer opens an SSE once the conversation
+        // is a child (server token assigned) or a parent (a child run_id
+        // is registered).
+        register_agent_view_consumer(conversation_id, self.terminal_view_id, ctx);
 
         ctx.emit(AgentViewControllerEvent::EnteredAgentView {
             conversation_id,
@@ -979,23 +969,8 @@ impl AgentViewController {
             .map(|conversation| conversation.exchange_count())
             .unwrap_or(0);
 
-        // Mirror the EnteredAgentView consumer registration: tear down the
-        // SSE-keeping role this view was satisfying for the conversation.
-        if warp_core::features::FeatureFlag::OrchestrationV2.is_enabled() {
-            let view_id = self.terminal_view_id;
-            crate::ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::handle(
-                ctx,
-            )
-            .update(ctx, |streamer, ctx| {
-                streamer.unregister_consumer(
-                    conversation_id,
-                    crate::ai::blocklist::orchestration_event_streamer::ConsumerId::AgentView(
-                        view_id,
-                    ),
-                    ctx,
-                );
-            });
-        }
+        // Mirror the EnteredAgentView registration above.
+        unregister_agent_view_consumer(conversation_id, self.terminal_view_id, ctx);
 
         ctx.emit(AgentViewControllerEvent::ExitedAgentView {
             conversation_id,

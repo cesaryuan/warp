@@ -5,6 +5,9 @@ use chrono::{DateTime, Utc};
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::blocklist::agent_view::{AgentViewController, AgentViewControllerEvent};
+use crate::ai::blocklist::orchestration_event_streamer::{
+    register_agent_view_consumer, unregister_agent_view_consumer,
+};
 use crate::ai::blocklist::BlocklistAIHistoryModel;
 use crate::terminal::model::session::active_session::ActiveSession;
 use warpui::{
@@ -122,32 +125,16 @@ impl ActiveAgentViewsModel {
             },
         );
 
-        // If the controller already has an active agent view (typical on
-        // pane re-attach after a `HiddenForClose` detach — the
-        // unregister path tore down the streamer consumer, but the
-        // controller's `agent_view_state` is still `Active`), restore the
-        // streamer consumer registration. The `EnteredAgentView`
-        // subscription below only fires on subsequent state transitions,
-        // not on the existing-already-Active state at registration time.
-        if warp_core::features::FeatureFlag::OrchestrationV2.is_enabled() {
-            if let Some(conversation_id) = controller
-                .as_ref(ctx)
-                .agent_view_state()
-                .active_conversation_id()
-            {
-                crate::ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::handle(
-                    ctx,
-                )
-                .update(ctx, |streamer, ctx| {
-                    streamer.register_consumer(
-                        conversation_id,
-                        crate::ai::blocklist::orchestration_event_streamer::ConsumerId::AgentView(
-                            terminal_view_id,
-                        ),
-                        ctx,
-                    );
-                });
-            }
+        // On pane re-attach the controller's `agent_view_state` is still
+        // `Active` while the unregister path has already torn down the
+        // streamer consumer. Re-register here; the `EnteredAgentView`
+        // subscription only fires on subsequent state transitions.
+        if let Some(conversation_id) = controller
+            .as_ref(ctx)
+            .agent_view_state()
+            .active_conversation_id()
+        {
+            register_agent_view_consumer(conversation_id, terminal_view_id, ctx);
         }
 
         ctx.subscribe_to_model(controller, move |model, event, ctx| match event {
@@ -226,24 +213,9 @@ impl ActiveAgentViewsModel {
             }
 
             if let Some(conversation_id) = closed_conversation_id {
-                // Mirror enter_agent_view_internal's consumer registration:
-                // the pane-close path does not run exit_agent_view_internal,
-                // so we have to unregister here ourselves.
-                if warp_core::features::FeatureFlag::OrchestrationV2.is_enabled() {
-                    crate::ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::handle(
-                        ctx,
-                    )
-                    .update(ctx, |streamer, ctx| {
-                        streamer.unregister_consumer(
-                            conversation_id,
-                            crate::ai::blocklist::orchestration_event_streamer::ConsumerId::AgentView(
-                                terminal_pane_id,
-                            ),
-                            ctx,
-                        );
-                    });
-                }
-
+                // The pane-close path bypasses exit_agent_view_internal, so
+                // unregister the streamer consumer here.
+                unregister_agent_view_consumer(conversation_id, terminal_pane_id, ctx);
                 ctx.emit(ActiveAgentViewsEvent::ConversationClosed { conversation_id });
             }
         }

@@ -41,8 +41,9 @@ use crate::{
             AmbientConversationStatus,
         },
         blocklist::{
-            agent_view::AgentViewEntryOrigin, BlocklistAIHistoryEvent, BlocklistAIHistoryModel,
-            BlocklistAIPermissions,
+            agent_view::AgentViewEntryOrigin,
+            orchestration_event_streamer::{register_driver_consumer, unregister_driver_consumer},
+            BlocklistAIHistoryEvent, BlocklistAIHistoryModel, BlocklistAIPermissions,
         },
         cloud_environments::{AmbientAgentEnvironment, CloudAmbientAgentEnvironment},
         execution_profiles::profiles::AIExecutionProfilesModel,
@@ -293,15 +294,12 @@ pub struct AgentDriver {
     /// consumer for, if any. Set on first observation (or at construction
     /// for resumed conversations); used by `unregister_streamer_consumer`
     /// at end of run.
-    streamer_registered_conversation_id: Arc<Mutex<Option<AIConversationId>>>,
+    streamer_registered_conversation_id: Option<AIConversationId>,
 
-    /// The parent agent run's `run_id`, when this driver run was spawned
-    /// by another agent (via `start_agent` or the public spawn API).
-    /// Sourced from the server task metadata. Stamped onto the
-    /// conversation's `parent_agent_id` field at register time so that
-    /// the streamer's child-role check succeeds in driver-hosted
-    /// processes (CLI subprocesses, cloud workers), which never see the
-    /// parent's local `AIConversationId`.
+    /// Parent agent run's `run_id` from the server task metadata, when
+    /// this driver run was spawned by another agent. Stamped onto the
+    /// conversation's `parent_agent_id` field at register time so the
+    /// streamer recognizes the child role in driver-hosted processes.
     parent_run_id: Option<String>,
 }
 
@@ -608,9 +606,8 @@ impl AgentDriver {
 
         // Inject cloud provider env vars.
         cloud_provider::collect_env_vars(&cloud_providers, &mut env_vars)?;
-        // Clone before consuming `parent_run_id` for env vars; the field on
-        // `Self` is needed at register time to stamp `parent_agent_id` onto
-        // the conversation so the streamer recognizes the child role.
+        // Clone before consuming for env vars; the field on `Self` is
+        // also needed at register time.
         let parent_run_id_for_self = parent_run_id.clone();
         env_vars.extend(task_env_vars(
             task_id.as_ref(),
@@ -641,31 +638,15 @@ impl AgentDriver {
         });
 
         let streamer_consumer_id = Uuid::new_v4();
-        let streamer_registered_conversation_id: Arc<Mutex<Option<AIConversationId>>> =
-            Arc::new(Mutex::new(None));
+        let mut streamer_registered_conversation_id: Option<AIConversationId> = None;
 
-        // If we're resuming an existing conversation we already know its
-        // ID; register the driver as a consumer right away so the streamer
-        // can satisfy the parent gate as soon as a child is registered.
+        // For a resumed conversation the ID is known up front; register
+        // immediately so the streamer can satisfy the parent gate as soon
+        // as the first child is registered.
         if let Some(conv_id) = restored_conversation_id {
-            if warp_core::features::FeatureFlag::OrchestrationV2.is_enabled() {
-                stamp_parent_agent_id_if_some(conv_id, parent_run_id_for_self.as_deref(), ctx);
-                crate::ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::handle(
-                    ctx,
-                )
-                .update(ctx, |streamer, ctx| {
-                    streamer.register_consumer(
-                        conv_id,
-                        crate::ai::blocklist::orchestration_event_streamer::ConsumerId::Driver(
-                            streamer_consumer_id,
-                        ),
-                        ctx,
-                    );
-                });
-            }
-            if let Ok(mut guard) = streamer_registered_conversation_id.lock() {
-                *guard = Some(conv_id);
-            }
+            stamp_parent_agent_id_if_some(conv_id, parent_run_id_for_self.as_deref(), ctx);
+            register_driver_consumer(conv_id, streamer_consumer_id, ctx);
+            streamer_registered_conversation_id = Some(conv_id);
         }
 
         Ok(Self {
@@ -691,28 +672,14 @@ impl AgentDriver {
         })
     }
 
-    /// Unregisters this driver's `ConsumerId::Driver` registration with
-    /// `OrchestrationEventStreamer`, if one was made. Safe to call when no
-    /// registration exists or when `OrchestrationV2` is disabled.
+    /// Pair to the driver-consumer registration in `new` and `execute_run`.
+    /// No-op when no registration was made or when `OrchestrationV2` is
+    /// disabled.
     fn unregister_streamer_consumer(&self, ctx: &mut ModelContext<Self>) {
-        if !warp_core::features::FeatureFlag::OrchestrationV2.is_enabled() {
-            return;
-        }
-        let conversation_id = self
-            .streamer_registered_conversation_id
-            .lock()
-            .ok()
-            .and_then(|guard| *guard);
-        let Some(conversation_id) = conversation_id else {
+        let Some(conversation_id) = self.streamer_registered_conversation_id else {
             return;
         };
-        let consumer_id = crate::ai::blocklist::orchestration_event_streamer::ConsumerId::Driver(
-            self.streamer_consumer_id,
-        );
-        crate::ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::handle(ctx)
-            .update(ctx, |streamer, ctx| {
-                streamer.unregister_consumer(conversation_id, consumer_id, ctx);
-            });
+        unregister_driver_consumer(conversation_id, self.streamer_consumer_id, ctx);
     }
 
     pub fn set_output_format(&mut self, output_format: OutputFormat) {
@@ -1760,57 +1727,21 @@ impl AgentDriver {
         let server_api_for_conversation_update = server_api.clone();
         let task_id_for_conversation_update = self.task_id;
 
-        // Capture the streamer consumer state so the event closure can
-        // register the driver as a consumer on first observation of a
-        // conversation_id for our terminal.
-        let streamer_consumer_id = self.streamer_consumer_id;
-        let streamer_registered_conversation_id =
-            Arc::clone(&self.streamer_registered_conversation_id);
-        let parent_run_id_for_closure = self.parent_run_id.clone();
-
         ctx.subscribe_to_model(&history_model_handle, move |me, event, ctx| {
             if event.terminal_view_id().is_some_and(|id| id != terminal_id) {
                 return;
             }
 
-            // On the first observation of a conversation_id for our
-            // terminal, register the driver as a consumer of orchestration
-            // events for that conversation. Idempotent for resumed
-            // conversations (already registered in `new`).
-            if warp_core::features::FeatureFlag::OrchestrationV2.is_enabled() {
+            // On the first event that carries a conversation_id, stamp
+            // parent_agent_id (so the streamer recognizes the child role)
+            // and register the driver as a consumer. Idempotent for
+            // resumed conversations — those are already registered in
+            // `new`.
+            if me.streamer_registered_conversation_id.is_none() {
                 if let Some(conv_id) = event_conversation_id(event) {
-                    let already_registered = streamer_registered_conversation_id
-                        .lock()
-                        .ok()
-                        .map(|guard| guard.is_some())
-                        .unwrap_or(true);
-                    if !already_registered {
-                        if let Ok(mut guard) = streamer_registered_conversation_id.lock() {
-                            *guard = Some(conv_id);
-                        }
-                        // Stamp the parent's run_id onto the conversation
-                        // BEFORE registering the consumer, so the
-                        // streamer's eligibility check sees the child role
-                        // when the consumer registration triggers
-                        // re-evaluation.
-                        stamp_parent_agent_id_if_some(
-                            conv_id,
-                            parent_run_id_for_closure.as_deref(),
-                            ctx,
-                        );
-                        crate::ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::handle(
-                            ctx,
-                        )
-                        .update(ctx, |streamer, ctx| {
-                            streamer.register_consumer(
-                                conv_id,
-                                crate::ai::blocklist::orchestration_event_streamer::ConsumerId::Driver(
-                                    streamer_consumer_id,
-                                ),
-                                ctx,
-                            );
-                        });
-                    }
+                    me.streamer_registered_conversation_id = Some(conv_id);
+                    stamp_parent_agent_id_if_some(conv_id, me.parent_run_id.as_deref(), ctx);
+                    register_driver_consumer(conv_id, me.streamer_consumer_id, ctx);
                 }
             }
 
@@ -2420,13 +2351,9 @@ pub(super) async fn report_driver_error(
     }
 }
 
-/// Stamps `parent_agent_id` onto a conversation in the local
-/// `BlocklistAIHistoryModel` if a `parent_run_id` is provided. Under
-/// orchestration v2, `parent_agent_id` IS the parent's run_id. The
-/// agent_sdk driver calls this at register time so the streamer's
-/// child-role check (`is_child_agent_conversation`) succeeds in
-/// driver-hosted processes (CLI subprocesses, cloud workers), which
-/// never see the parent's local `AIConversationId`.
+/// Stamps `parent_agent_id` (= parent's `run_id` under v2) onto the
+/// driver-hosted conversation so the streamer's child-role check
+/// succeeds. No-op when `parent_run_id` is `None` (a top-level run).
 fn stamp_parent_agent_id_if_some(
     conv_id: AIConversationId,
     parent_run_id: Option<&str>,

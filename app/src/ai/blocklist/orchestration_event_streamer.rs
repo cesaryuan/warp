@@ -1,6 +1,12 @@
 use super::history_model::{BlocklistAIHistoryEvent, BlocklistAIHistoryModel};
-use super::orchestration_events::{OrchestrationEventService, PendingEvent, PendingEventDetail};
-use crate::ai::agent::{conversation::AIConversationId, ReceivedMessageInput};
+use super::orchestration_events::{
+    build_lifecycle_event, LifecycleEventDetailPayload, LifecycleEventDetailStage,
+    OrchestrationEventService, PendingEvent, PendingEventDetail,
+};
+use crate::ai::agent::{
+    conversation::AIConversationId, AIAgentExchangeId, AIAgentOutputMessageType,
+    ReceivedMessageInput,
+};
 use crate::ai::agent_events::{
     run_agent_event_driver, AgentEventConsumer, AgentEventConsumerControlFlow,
     AgentEventDriverConfig, MessageHydrator, ServerApiAgentEventSource,
@@ -14,9 +20,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+use warp_core::features::FeatureFlag;
 use warp_multi_agent_api as api;
 use warpui::r#async::Timer;
-use warpui::{Entity, EntityId, ModelContext, SingletonEntity};
+use warpui::{
+    Entity, EntityId, GetSingletonModelHandle, ModelContext, SingletonEntity, UpdateModel,
+};
 
 /// How often (milliseconds) the drain timer checks for SSE events.
 const SSE_DRAIN_INTERVAL_MS: u64 = 500;
@@ -179,13 +188,9 @@ impl OrchestrationEventStreamer {
                     .unwrap_or(0)
             );
         }
-        // The driver-hosted path stamps `parent_agent_id` onto the
-        // conversation immediately before calling `register_consumer`,
-        // which is often *after* `ConversationServerTokenAssigned` has
-        // already been processed by `on_server_token_assigned`. In that
-        // case `self_run_id` was never registered. Re-run the helper
-        // here so eligibility re-evaluation sees a non-empty
-        // `watched_run_ids` and `start_sse_connection` opens the stream.
+        // Driver-hosted callers stamp `parent_agent_id` immediately
+        // before this call; if the server-token event fired earlier, the
+        // helper picks up the just-stamped child role here.
         self.try_insert_self_run_id_if_in_tree(conversation_id, ctx);
         self.reevaluate_eligibility(conversation_id, ctx);
     }
@@ -237,12 +242,10 @@ impl OrchestrationEventStreamer {
             .entry(conversation_id)
             .or_default()
             .insert(run_id);
-        // Registering a child run_id flips the conversation into the
-        // parent role; ensure self_run_id is also watched so the parent
-        // receives messages (events with `run_id == self_run_id`) from
-        // its children. Without this, the parent only sees child
-        // lifecycle events, not child→parent messages. Direct insertion
-        // avoids re-entering this function and a redundant reevaluate.
+        // Adding the first child flips the conversation into the parent
+        // role; ensure self_run_id is also watched so child→parent
+        // messages match the SSE filter (without it the parent only sees
+        // child lifecycle events).
         let self_inserted = self.try_insert_self_run_id_if_in_tree(conversation_id, ctx);
         if inserted || self_inserted {
             self.reevaluate_eligibility(conversation_id, ctx);
@@ -296,28 +299,15 @@ impl OrchestrationEventStreamer {
         conversation_id: AIConversationId,
         ctx: &mut ModelContext<Self>,
     ) {
-        // Both roles' self_run_id registration runs through the shared
-        // helper. Re-evaluating eligibility here picks up the just-
-        // inserted run_id (if any) as well as any other state that may
-        // have changed at token-assigned time.
         if self.try_insert_self_run_id_if_in_tree(conversation_id, ctx) {
             self.reevaluate_eligibility(conversation_id, ctx);
         }
     }
 
-    /// If the conversation has any orchestration role (child via
-    /// `parent_conversation_id` / `parent_agent_id`, or parent via
-    /// already-watched non-self run_ids), inserts its `self_run_id`
-    /// directly into `watched_run_ids` and returns true. Skips passive
-    /// views of remote runs (shared-session viewers, remote-child
-    /// placeholders) and returns false there.
-    ///
-    /// Direct insertion avoids re-entering `register_watched_run_id` and
-    /// a redundant reevaluate; callers are responsible for calling
-    /// `reevaluate_eligibility` after this returns.
-    ///
-    /// Idempotent: safe to call multiple times and safe to call before
-    /// the role signals become true.
+    /// Inserts `self_run_id` into `watched_run_ids` if the conversation
+    /// has any orchestration role (child or parent) and is not a passive
+    /// remote-run view. Returns whether anything was inserted; callers
+    /// reevaluate eligibility on `true`. Idempotent.
     fn try_insert_self_run_id_if_in_tree(
         &mut self,
         conversation_id: AIConversationId,
@@ -345,11 +335,8 @@ impl OrchestrationEventStreamer {
             (run_id, is_child)
         };
 
-        // Parent role: at least one watched run_id that isn't this
-        // conversation's own self_run_id. The parent needs self_run_id
-        // in the SSE filter to receive messages addressed to it from its
-        // children (events with `event.run_id == self_run_id`); without
-        // it, only child lifecycle events arrive.
+        // Parent role: any watched run_id that isn't this conversation's
+        // own self_run_id (i.e. a registered child).
         let is_parent = self
             .watched_run_ids
             .get(&conversation_id)
@@ -368,7 +355,7 @@ impl OrchestrationEventStreamer {
     fn on_streaming_exchange_updated(
         &mut self,
         conversation_id: AIConversationId,
-        exchange_id: crate::ai::agent::AIAgentExchangeId,
+        exchange_id: AIAgentExchangeId,
         ctx: &mut ModelContext<Self>,
     ) {
         let Some(pending) = self.pending_delivery.get(&conversation_id) else {
@@ -390,9 +377,8 @@ impl OrchestrationEventStreamer {
         let mut confirmed_ids = Vec::new();
         if let Some(output) = exchange.output_status.output() {
             for msg in &output.get().messages {
-                if let crate::ai::agent::AIAgentOutputMessageType::MessagesReceivedFromAgents {
-                    messages,
-                } = &msg.message
+                if let AIAgentOutputMessageType::MessagesReceivedFromAgents { messages } =
+                    &msg.message
                 {
                     for received in messages {
                         if pending_ids.contains(received.message_id.as_str()) {
@@ -483,20 +469,10 @@ impl OrchestrationEventStreamer {
 
     // ---- Eligibility predicate ---------------------------------------
 
-    /// True iff the conversation has a parent agent run from this
-    /// process's perspective. Two signals satisfy this:
-    ///
-    /// - `parent_conversation_id.is_some()` — the parent has a local
-    ///   placeholder in this process (typically the parent's GUI), set
-    ///   by `start_new_child_conversation` when the child was spawned.
-    /// - `parent_agent_id.is_some()` — the conversation knows its
-    ///   parent's server-side agent identifier (under v2, the parent's
-    ///   `run_id`). This is the signal available in driver-hosted
-    ///   processes (CLI subprocesses, cloud workers) which never see the
-    ///   parent's local `AIConversationId` but do know the parent's
-    ///   run_id from the task metadata. The agent_sdk driver stamps this
-    ///   field onto the conversation at register time so the streamer's
-    ///   child-role check succeeds in the driver process.
+    /// Child role: the conversation either has a local placeholder for
+    /// the parent (`parent_conversation_id`, set in the GUI parent) or
+    /// knows the parent's server-side run_id (`parent_agent_id`,
+    /// stamped by the agent_sdk driver in driver-hosted processes).
     fn is_child_agent_conversation(
         &self,
         conversation_id: AIConversationId,
@@ -866,19 +842,15 @@ fn convert_lifecycle_events(events: &[AgentRunEvent], self_run_id: &str) -> Vec<
             // TODO: Parse richer detail payloads (reason, error_message) from
             // the server event log once the schema supports them.
             let detail = match lifecycle_type {
-                api::LifecycleEventType::Errored => {
-                    super::orchestration_events::LifecycleEventDetailPayload {
-                        stage: Some(
-                            super::orchestration_events::LifecycleEventDetailStage::Runtime,
-                        ),
-                        reason: event.ref_id.clone(),
-                        ..Default::default()
-                    }
-                }
-                _ => super::orchestration_events::LifecycleEventDetailPayload::default(),
+                api::LifecycleEventType::Errored => LifecycleEventDetailPayload {
+                    stage: Some(LifecycleEventDetailStage::Runtime),
+                    reason: event.ref_id.clone(),
+                    ..Default::default()
+                },
+                _ => LifecycleEventDetailPayload::default(),
             };
             let event_id = Uuid::new_v4().to_string();
-            Some(super::orchestration_events::build_lifecycle_event(
+            Some(build_lifecycle_event(
                 event_id,
                 event.run_id.clone(),
                 lifecycle_type,
@@ -916,6 +888,88 @@ fn build_pending_events(
         });
     }
     pending
+}
+
+// ---- Free-function consumer registration helpers ---------------------
+//
+// Wrap the feature-flag check + singleton handle update so call sites
+// in `AgentViewController`, `ActiveAgentViewsModel`, and the agent_sdk
+// driver don't have to repeat the boilerplate. The generic bound
+// covers both `&mut AppContext` and `&mut ModelContext<T>` /
+// `&mut ViewContext<T>`.
+
+/// Registers an agent view as a consumer of orchestration events for
+/// `conversation_id`. No-op when `OrchestrationV2` is disabled.
+pub fn register_agent_view_consumer<C>(
+    conversation_id: AIConversationId,
+    view_id: EntityId,
+    ctx: &mut C,
+) where
+    C: GetSingletonModelHandle + UpdateModel,
+{
+    register_consumer_if_v2(conversation_id, ConsumerId::AgentView(view_id), ctx);
+}
+
+/// Pair to [`register_agent_view_consumer`].
+pub fn unregister_agent_view_consumer<C>(
+    conversation_id: AIConversationId,
+    view_id: EntityId,
+    ctx: &mut C,
+) where
+    C: GetSingletonModelHandle + UpdateModel,
+{
+    unregister_consumer_if_v2(conversation_id, ConsumerId::AgentView(view_id), ctx);
+}
+
+/// Registers an `agent_sdk` driver as a consumer of orchestration
+/// events for `conversation_id`. No-op when `OrchestrationV2` is
+/// disabled.
+pub fn register_driver_consumer<C>(conversation_id: AIConversationId, driver_id: Uuid, ctx: &mut C)
+where
+    C: GetSingletonModelHandle + UpdateModel,
+{
+    register_consumer_if_v2(conversation_id, ConsumerId::Driver(driver_id), ctx);
+}
+
+/// Pair to [`register_driver_consumer`].
+pub fn unregister_driver_consumer<C>(
+    conversation_id: AIConversationId,
+    driver_id: Uuid,
+    ctx: &mut C,
+) where
+    C: GetSingletonModelHandle + UpdateModel,
+{
+    unregister_consumer_if_v2(conversation_id, ConsumerId::Driver(driver_id), ctx);
+}
+
+fn register_consumer_if_v2<C>(
+    conversation_id: AIConversationId,
+    consumer_id: ConsumerId,
+    ctx: &mut C,
+) where
+    C: GetSingletonModelHandle + UpdateModel,
+{
+    if !FeatureFlag::OrchestrationV2.is_enabled() {
+        return;
+    }
+    OrchestrationEventStreamer::handle(ctx).update(ctx, |streamer, ctx| {
+        streamer.register_consumer(conversation_id, consumer_id, ctx);
+    });
+}
+
+fn unregister_consumer_if_v2<C>(
+    conversation_id: AIConversationId,
+    consumer_id: ConsumerId,
+    ctx: &mut C,
+) where
+    C: GetSingletonModelHandle + UpdateModel,
+{
+    if !FeatureFlag::OrchestrationV2.is_enabled() {
+        return;
+    }
+    OrchestrationEventStreamer::handle(ctx).update(ctx, |streamer, ctx| {
+        streamer.unregister_consumer(conversation_id, consumer_id, ctx);
+    });
 }
 
 #[cfg(test)]
