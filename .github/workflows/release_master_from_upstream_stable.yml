@@ -21,7 +21,7 @@ on:
         description: Build Linux x86_64 artifacts.
         required: true
         type: boolean
-        default: true
+        default: false
       build_linux_arm:
         description: Build Linux ARM artifacts.
         required: true
@@ -32,6 +32,11 @@ on:
         required: true
         type: boolean
         default: true
+      build_windows_arm:
+        description: Build Windows ARM artifacts.
+        required: true
+        type: boolean
+        default: false
       build_macos:
         description: Build macOS artifacts.
         required: true
@@ -128,9 +133,10 @@ jobs:
     with:
       channel: stable
       source_ref: refs/heads/master
-      build_linux: ${{ github.event_name != 'workflow_dispatch' || inputs.build_linux }}
+      build_linux: ${{ github.event_name == 'workflow_dispatch' && inputs.build_linux || false }}
       build_linux_arm: ${{ github.event_name == 'workflow_dispatch' && inputs.build_linux_arm || false }}
-      build_windows: ${{ github.event_name != 'workflow_dispatch' || inputs.build_windows }}
+      build_windows: ${{ github.event_name == 'workflow_dispatch' && inputs.build_windows || true }}
+      build_windows_arm: ${{ github.event_name == 'workflow_dispatch' && inputs.build_windows_arm || false }}
       build_macos: ${{ github.event_name == 'workflow_dispatch' && inputs.build_macos || false }}
       build_web: ${{ github.event_name == 'workflow_dispatch' && inputs.build_web || false }}
       should_publish: true
