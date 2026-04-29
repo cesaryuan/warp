@@ -81,3 +81,19 @@ fn llm_info_round_trip_serializes_and_deserializes() {
 
     assert_eq!(info, round_tripped);
 }
+
+#[test]
+fn effective_disable_reason_clears_requires_upgrade_when_using_api_key() {
+    assert_eq!(
+        effective_disable_reason(Some(&DisableReason::RequiresUpgrade), true),
+        None,
+    );
+}
+
+#[test]
+fn effective_disable_reason_preserves_other_disable_reasons() {
+    assert_eq!(
+        effective_disable_reason(Some(&DisableReason::AdminDisabled), true),
+        Some(DisableReason::AdminDisabled),
+    );
+}

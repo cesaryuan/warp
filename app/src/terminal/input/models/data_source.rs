@@ -18,8 +18,8 @@ use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{AppContext, Element, Entity, EntityId, SingletonEntity as _};
 
 use crate::ai::llms::{
-    is_using_api_key_for_provider, DisableReason, LLMId, LLMInfo, LLMPreferences, LLMProvider,
-    LLMSpec,
+    effective_disable_reason_for_model, is_using_api_key_for_provider, DisableReason, LLMId,
+    LLMInfo, LLMPreferences, LLMProvider, LLMSpec,
 };
 use crate::auth::AuthStateProvider;
 use crate::features::FeatureFlag;
@@ -223,15 +223,7 @@ struct ModelSearchItem {
 
 impl ModelSearchItem {
     fn new(llm: &LLMInfo, active_llm_id: &LLMId, app: &AppContext) -> Self {
-        // If the model requires an upgrade but the user already has a BYOK key
-        // for this provider, treat it as enabled by clearing the disable reason.
-        let disable_reason = if llm.disable_reason == Some(DisableReason::RequiresUpgrade)
-            && is_using_api_key_for_provider(&llm.provider, app)
-        {
-            None
-        } else {
-            llm.disable_reason.clone()
-        };
+        let disable_reason = effective_disable_reason_for_model(llm, app);
         Self {
             id: llm.id.clone(),
             provider: llm.provider.clone(),

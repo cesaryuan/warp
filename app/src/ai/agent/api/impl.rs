@@ -7,6 +7,7 @@ use warp_multi_agent_api as api;
 
 use crate::server::server_api::ServerApi;
 
+use super::local_openai::generate_local_openai_responses_output;
 use super::{convert_to::convert_input, ConvertToAPITypeError, RequestParams, ResponseStream};
 
 pub async fn generate_multi_agent_output(
@@ -14,6 +15,14 @@ pub async fn generate_multi_agent_output(
     mut params: RequestParams,
     cancellation_rx: futures::channel::oneshot::Receiver<()>,
 ) -> Result<ResponseStream, ConvertToAPITypeError> {
+    if should_use_local_openai_responses_backend(&params) {
+        return Ok(generate_local_openai_responses_output(
+            server_api,
+            params,
+            cancellation_rx,
+        ));
+    }
+
     let supported_tools = params
         .supported_tools_override
         .take()
@@ -143,7 +152,28 @@ pub async fn generate_multi_agent_output(
     }
 }
 
-fn get_supported_tools(params: &RequestParams) -> Vec<api::ToolType> {
+/// Returns whether a request is eligible to use the local OpenAI Responses backend.
+pub(super) fn should_use_local_openai_responses_backend(params: &RequestParams) -> bool {
+    params.local_openai_responses_backend_enabled
+        && matches!(params.model_provider, crate::ai::llms::LLMProvider::OpenAI)
+        && matches!(
+            params.session_context.session_type(),
+            None | Some(SessionType::Local)
+        )
+        && params.ambient_agent_task_id.is_none()
+        && !params.orchestration_enabled
+        && params.target_task_id.is_some()
+        && params.input.iter().all(|input| {
+            matches!(
+                input,
+                crate::ai::agent::AIAgentInput::UserQuery { .. }
+                    | crate::ai::agent::AIAgentInput::ActionResult { .. }
+            )
+        })
+}
+
+/// Returns the client-executable tool set for a request.
+pub(super) fn get_supported_tools(params: &RequestParams) -> Vec<api::ToolType> {
     let mut supported_tools = vec![
         api::ToolType::Grep,
         api::ToolType::FileGlob,
@@ -221,6 +251,7 @@ fn get_supported_tools(params: &RequestParams) -> Vec<api::ToolType> {
     supported_tools
 }
 
+/// Returns the CLI-agent-specific tool set for a request.
 fn get_supported_cli_agent_tools(params: &RequestParams) -> Vec<api::ToolType> {
     let mut supported_cli_agent_tools = vec![
         api::ToolType::WriteToLongRunningShellCommand,

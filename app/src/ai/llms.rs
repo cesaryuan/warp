@@ -40,6 +40,29 @@ pub fn is_using_api_key_for_provider(provider: &LLMProvider, app: &AppContext) -
     }
 }
 
+/// Returns the effective disable reason after accounting for provider API keys.
+pub fn effective_disable_reason(
+    disable_reason: Option<&DisableReason>,
+    is_using_api_key: bool,
+) -> Option<DisableReason> {
+    match (disable_reason, is_using_api_key) {
+        (Some(DisableReason::RequiresUpgrade), true) => None,
+        (Some(reason), _) => Some(reason.clone()),
+        (None, _) => None,
+    }
+}
+
+/// Returns the effective disable reason for a model in the current app context.
+pub fn effective_disable_reason_for_model(
+    llm: &LLMInfo,
+    app: &AppContext,
+) -> Option<DisableReason> {
+    effective_disable_reason(
+        llm.disable_reason.as_ref(),
+        is_using_api_key_for_provider(&llm.provider, app),
+    )
+}
+
 /// Key for cached LLM metadata in user preferences.
 ///
 /// Note: this key used to store a single [`AvailableLLMs`]

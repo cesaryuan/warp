@@ -1204,6 +1204,18 @@ define_settings_group!(AISettings, settings: [
         description: "Whether Warp credits can be used even when providing your own API key.",
     }
 
+    // Whether to bypass Warp's remote agent backend and call a local OpenAI-compatible
+    // Responses API endpoint directly for Warp Agent requests.
+    local_openai_responses_backend_enabled: LocalOpenAIResponsesBackendEnabled {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        private: false,
+        toml_path: "cloud_platform.third_party_api_keys.local_openai_responses_backend_enabled",
+        description: "Whether Warp Agent requests should use a local OpenAI-compatible Responses API backend.",
+    }
+
     should_render_use_agent_footer_for_user_commands: ShouldRenderUseAgentToolbarForUserCommands {
         type: bool,
         default: true,

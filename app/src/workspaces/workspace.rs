@@ -573,10 +573,10 @@ impl BillingMetadata {
         }
     }
 
+    /// Returns whether BYOK is enabled for this billing context.
     pub fn is_byo_api_key_enabled(&self) -> bool {
-        self.tier
-            .byo_api_key_policy
-            .is_some_and(|policy| policy.enabled)
+        // BYOK is now available to every account, regardless of billing tier.
+        true
     }
 
     pub fn has_overages_used(&self) -> bool {

@@ -2,6 +2,7 @@ pub(crate) mod convert_conversation;
 mod convert_from;
 mod convert_to;
 mod r#impl;
+mod local_openai;
 
 pub use ai::agent::convert::ConvertToAPITypeError;
 use ai::api_keys::ApiKeyManager;
@@ -22,9 +23,13 @@ use warp_core::execution_mode::AppExecutionMode;
 use warp_core::features::FeatureFlag;
 
 use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::agent::task::TaskId;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::{
-    ai::{blocklist::SessionContext, llms::LLMId},
+    ai::{
+        blocklist::SessionContext,
+        llms::{LLMId, LLMPreferences, LLMProvider},
+    },
     server::server_api::AIApiError,
 };
 
@@ -94,7 +99,9 @@ impl TryFrom<ServerConversationToken>
 
 #[derive(Debug, Clone)]
 pub struct RequestParams {
+    pub conversation_id: AIConversationId,
     pub input: Vec<AIAgentInput>,
+    pub target_task_id: Option<TaskId>,
     pub conversation_token: Option<ServerConversationToken>,
     pub forked_from_conversation_token: Option<ServerConversationToken>,
     pub ambient_agent_task_id: Option<AmbientAgentTaskId>,
@@ -116,6 +123,10 @@ pub struct RequestParams {
     /// User-provided API keys for AI providers (BYO API Key).
     pub api_keys: Option<warp_multi_agent_api::request::settings::ApiKeys>,
     pub allow_use_of_warp_credits_with_byok: bool,
+    pub local_openai_responses_backend_enabled: bool,
+    pub local_openai_api_key: Option<String>,
+    pub local_openai_base_url: Option<String>,
+    pub model_provider: LLMProvider,
     pub autonomy_level: warp_multi_agent_api::AutonomyLevel,
     pub isolation_level: warp_multi_agent_api::IsolationLevel,
     pub web_search_enabled: bool,
@@ -233,12 +244,20 @@ impl RequestParams {
         let should_redact_secrets = get_secret_obfuscation_mode(app).should_redact_secret();
 
         let user_workspaces = UserWorkspaces::as_ref(app);
-        let api_keys = ApiKeyManager::as_ref(app).api_keys_for_request(
+        let api_key_manager = ApiKeyManager::as_ref(app);
+        let stored_api_keys = api_key_manager.keys().clone();
+        let api_keys = api_key_manager.api_keys_for_request(
             user_workspaces.is_byo_api_key_enabled(),
             user_workspaces.is_aws_bedrock_credentials_enabled(app),
         );
         let allow_use_of_warp_credits_with_byok =
             *AISettings::as_ref(app).can_use_warp_credits_with_byok;
+        let local_openai_responses_backend_enabled =
+            *AISettings::as_ref(app).local_openai_responses_backend_enabled;
+        let model_provider = LLMPreferences::as_ref(app)
+            .get_llm_info(&request_input.model_id)
+            .map(|info| info.provider.clone())
+            .unwrap_or(LLMProvider::Unknown);
 
         let app_execution_mode = AppExecutionMode::as_ref(app);
         let autonomy_level = if app_execution_mode.is_autonomous() {
@@ -280,7 +299,9 @@ impl RequestParams {
                 .is_none_or(|t| matches!(t, crate::terminal::model::session::SessionType::Local));
 
         Self {
+            conversation_id: conversation.id,
             input: request_input.all_inputs().cloned().collect(),
+            target_task_id: request_input.input_messages.keys().next().cloned(),
             conversation_token: conversation.server_conversation_token,
             forked_from_conversation_token: conversation.forked_from_conversation_token,
             ambient_agent_task_id: conversation.ambient_agent_task_id,
@@ -299,6 +320,10 @@ impl RequestParams {
             should_redact_secrets,
             api_keys,
             allow_use_of_warp_credits_with_byok,
+            local_openai_responses_backend_enabled,
+            local_openai_api_key: stored_api_keys.openai,
+            local_openai_base_url: stored_api_keys.openai_base_url,
+            model_provider,
             autonomy_level,
             isolation_level,
             web_search_enabled,

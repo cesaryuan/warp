@@ -9,13 +9,12 @@ use crate::server::server_api::ServerApiProvider;
 use crate::workspaces::{
     user_workspaces::UserWorkspaces,
     workspace::{
-        AiOverages, ByoApiKeyPolicy, CustomerType, EnterpriseCreditsAutoReloadPolicy,
-        EnterprisePayAsYouGoPolicy, PurchaseAddOnCreditsPolicy, Workspace, WorkspaceUid,
+        AiOverages, CustomerType, EnterpriseCreditsAutoReloadPolicy, EnterprisePayAsYouGoPolicy,
+        PurchaseAddOnCreditsPolicy, Workspace, WorkspaceUid,
     },
 };
 
 use ai::api_keys::ApiKeyManager;
-use warp_core::features::FeatureFlag;
 
 use super::*;
 
@@ -485,13 +484,10 @@ fn test_has_any_ai_remaining_false_both_payg_and_autoreload_disabled() {
 }
 
 #[test]
-fn test_has_any_ai_remaining_true_with_byok_enabled_and_key_provided() {
+fn test_has_any_ai_remaining_true_with_key_provided_on_free_workspace() {
     App::test((), |mut app| async move {
-        // Create a workspace with BYOK (Bring Your Own Key) enabled.
-        let (_uid, mut workspace) = create_test_workspace();
-        workspace.billing_metadata.tier.byo_api_key_policy =
-            Some(ByoApiKeyPolicy { enabled: true });
-
+        // Create a free-plan workspace with no BYOK billing policy.
+        let (_uid, workspace) = create_test_workspace();
         add_user_workspaces_with_workspace(&mut app, workspace);
         let request_usage_model = add_request_usage_model(&mut app);
 
@@ -506,20 +502,17 @@ fn test_has_any_ai_remaining_true_with_byok_enabled_and_key_provided() {
 
             assert!(
                 model.has_any_ai_remaining(ctx),
-                "expected has_any_ai_remaining to be true when BYOK is enabled and a key is provided",
+                "expected has_any_ai_remaining to be true when a key is provided on a free workspace",
             );
         });
     });
 }
 
 #[test]
-fn test_has_any_ai_remaining_false_with_byok_enabled_but_no_key() {
+fn test_has_any_ai_remaining_false_with_no_key_on_free_workspace() {
     App::test((), |mut app| async move {
-        // Create a workspace with BYOK enabled but no key provided.
-        let (_uid, mut workspace) = create_test_workspace();
-        workspace.billing_metadata.tier.byo_api_key_policy =
-            Some(ByoApiKeyPolicy { enabled: true });
-
+        // Create a free-plan workspace without any BYOK key configured.
+        let (_uid, workspace) = create_test_workspace();
         add_user_workspaces_with_workspace(&mut app, workspace);
         let request_usage_model = add_request_usage_model(&mut app);
 
@@ -530,7 +523,7 @@ fn test_has_any_ai_remaining_false_with_byok_enabled_but_no_key() {
 
             assert!(
                 !model.has_any_ai_remaining(ctx),
-                "expected has_any_ai_remaining to be false when BYOK is enabled but no key is provided",
+                "expected has_any_ai_remaining to be false when no key is provided on a free workspace",
             );
         });
     });
@@ -539,8 +532,6 @@ fn test_has_any_ai_remaining_false_with_byok_enabled_but_no_key() {
 #[test]
 fn test_has_any_ai_remaining_true_with_byo_key_and_no_workspace() {
     App::test((), |mut app| async move {
-        let _guard = FeatureFlag::SoloUserByok.override_enabled(true);
-
         // No workspace — user is not on a team.
         app.add_singleton_model(UserWorkspaces::default_mock);
         let request_usage_model = add_request_usage_model(&mut app);
