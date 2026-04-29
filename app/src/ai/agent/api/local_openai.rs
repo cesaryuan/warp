@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, Context as _};
-use async_channel::unbounded;
+use async_stream::stream;
+use futures::channel::oneshot;
+use futures::future::{select, Either};
 use parking_lot::FairMutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -14,7 +16,7 @@ use warp_multi_agent_api as api;
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::task::TaskId;
 use crate::ai::agent::{AIAgentContext, AIAgentInput};
-use crate::server::server_api::{AIApiError, ServerApi};
+use crate::server::server_api::ServerApi;
 
 use super::{Event, RequestParams, ResponseStream};
 use crate::ai::agent::api::r#impl::get_supported_tools;
@@ -108,50 +110,67 @@ fn conversation_state_store(
 }
 
 /// Generates a local OpenAI Responses-backed event stream for a Warp Agent request.
-pub async fn generate_local_openai_responses_output(
-    server_api: &ServerApi,
+pub fn generate_local_openai_responses_output(
+    server_api: std::sync::Arc<ServerApi>,
     params: RequestParams,
-) -> Result<ResponseStream, AIApiError> {
+    cancellation_rx: oneshot::Receiver<()>,
+) -> ResponseStream {
     let request_id = Uuid::new_v4().to_string();
     let conversation_token = params
         .conversation_token
         .as_ref()
         .map(|token| token.as_str().to_string())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let task_id = params
-        .target_task_id
-        .clone()
-        .ok_or_else(|| AIApiError::Other(anyhow!("Missing task ID for local OpenAI backend")))?;
+    let task_id = params.target_task_id.clone();
+    let model_name = params.model.clone().to_string();
 
-    let mut events = vec![Ok(stream_init_event(
-        conversation_token,
-        request_id.clone(),
-    ))];
+    Box::pin(stream! {
+        yield Ok(stream_init_event(conversation_token, request_id.clone()));
 
-    match execute_local_responses_request(server_api, &params, &task_id, &request_id).await {
-        Ok(mut output_events) => {
-            events.append(&mut output_events);
-        }
-        Err(error) => {
-            log::warn!("Local OpenAI Responses backend failed: {error:#}");
-            events.push(Ok(user_visible_error_event(
-                &task_id,
+        let Some(task_id) = task_id else {
+            let error = anyhow!("Missing task ID for local OpenAI backend");
+            yield Ok(user_visible_error_event(
+                &TaskId::new("missing-task".to_string()),
                 &request_id,
                 &error.to_string(),
-            )));
-            events.push(Ok(stream_finished_event(finished_reason_for_error(
-                &error,
-                params.model.clone().to_string(),
-            ))));
-        }
-    }
+            ));
+            yield Ok(stream_finished_event(finished_reason_for_error(&error, model_name)));
+            return;
+        };
 
-    let (tx, rx) = unbounded();
-    for event in events {
-        let _ = tx.send(event).await;
-    }
-    drop(tx);
-    Ok(Box::pin(rx))
+        let request_future = {
+            let server_api = server_api.clone();
+            let params = params.clone();
+            let task_id = task_id.clone();
+            let request_id = request_id.clone();
+            async move {
+                execute_local_responses_request(&server_api, &params, &task_id, &request_id).await
+            }
+        };
+        match select(Box::pin(request_future), Box::pin(cancellation_rx)).await {
+            Either::Left((result, _)) => {
+                match result {
+                    Ok(output_events) => {
+                        for event in output_events {
+                            yield event;
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!("Local OpenAI Responses backend failed: {error:#}");
+                        yield Ok(user_visible_error_event(
+                            &task_id,
+                            &request_id,
+                            &error.to_string(),
+                        ));
+                        yield Ok(stream_finished_event(
+                            finished_reason_for_error(&error, model_name),
+                        ));
+                    }
+                }
+            }
+            Either::Right((_cancelled, _)) => {}
+        }
+    })
 }
 
 /// Executes a single local Responses API turn and converts it into Warp ResponseEvents.

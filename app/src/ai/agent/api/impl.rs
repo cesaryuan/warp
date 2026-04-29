@@ -16,11 +16,11 @@ pub async fn generate_multi_agent_output(
     cancellation_rx: futures::channel::oneshot::Receiver<()>,
 ) -> Result<ResponseStream, ConvertToAPITypeError> {
     if should_use_local_openai_responses_backend(&params) {
-        let response_stream = generate_local_openai_responses_output(&server_api, params)
-            .await
-            .map_err(|error| ConvertToAPITypeError::from(anyhow::Error::from(error)))?;
-        let output_stream = response_stream.take_until(cancellation_rx);
-        return Ok(Box::pin(output_stream));
+        return Ok(generate_local_openai_responses_output(
+            server_api,
+            params,
+            cancellation_rx,
+        ));
     }
 
     let supported_tools = params
