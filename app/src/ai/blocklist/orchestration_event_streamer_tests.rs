@@ -246,91 +246,12 @@ fn finish_restore_fetch_uses_server_cursor_when_sqlite_is_absent() {
     });
 }
 
-#[test]
-fn restored_inprogress_parent_defers_delivery_until_success() {
-    use crate::ai::agent::conversation::{AIConversation, AIConversationId, ConversationStatus};
-    use crate::server::server_api::ai::MockAIClient;
-    use crate::server::server_api::ServerApiProvider;
-    use std::sync::Arc;
-    use warpui::App;
-
-    App::test((), |mut app| async move {
-        let _v2_guard = FeatureFlag::OrchestrationV2.override_enabled(true);
-
-        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
-
-        let mut conversation = AIConversation::new(false);
-        // Use a parsable UUID-shaped run_id so the poller can construct
-        // an `AmbientAgentTaskId` for the (mocked) server fetch.
-        conversation.set_run_id("550e8400-e29b-41d4-a716-446655440100".to_string());
-        let conversation_id: AIConversationId = conversation.id();
-        let terminal_view_id = warpui::EntityId::new();
-        history_model.update(&mut app, |model, ctx| {
-            model.restore_conversations(terminal_view_id, vec![conversation], ctx);
-            // The default status after restore is `InProgress` for live
-            // conversations, but assert it explicitly to make the test
-            // self-documenting.
-            model.update_conversation_status(
-                terminal_view_id,
-                conversation_id,
-                ConversationStatus::InProgress,
-                ctx,
-            );
-        });
-
-        let mut mock = MockAIClient::new();
-        // The async restore fetch may or may not complete during the test;
-        // a permissive expectation prevents spurious panics either way.
-        mock.expect_get_ambient_agent_task()
-            .returning(|_| Ok(make_ambient_task_with_event_seq(None)));
-        mock.expect_update_event_sequence_on_server()
-            .returning(|_, _| Ok(()));
-        let ai_client: Arc<dyn AIClient> = Arc::new(mock);
-        let server_api = ServerApiProvider::new_for_test().get();
-
-        let streamer = app.add_singleton_model(|ctx| {
-            OrchestrationEventStreamer::new_with_clients_for_test(ai_client, server_api, ctx)
-        });
-
-        // Synchronous part of `on_restored_conversations`: cursor seeded,
-        // own run_id watched. No event delivery yet because parent is
-        // InProgress.
-        streamer.update(&mut app, |me, ctx| {
-            me.on_restored_conversations(vec![conversation_id], ctx);
-        });
-        streamer.read(&app, |me, _| {
-            assert_eq!(me.event_cursor.get(&conversation_id).copied(), Some(0));
-            assert!(
-                me.watched_run_ids
-                    .get(&conversation_id)
-                    .is_some_and(|w| !w.is_empty()),
-                "own run_id should have been registered as watched"
-            );
-            assert!(
-                me.sse_connections.is_empty(),
-                "InProgress parent must not open SSE"
-            );
-        });
-
-        // Transitioning the conversation to Success should open an SSE
-        // connection for event delivery.
-        history_model.update(&mut app, |model, ctx| {
-            model.update_conversation_status(
-                terminal_view_id,
-                conversation_id,
-                ConversationStatus::Success,
-                ctx,
-            );
-        });
-        streamer.read(&app, |me, _| {
-            assert!(
-                me.sse_connections.contains_key(&conversation_id),
-                "Success transition with watched run_ids should open an SSE connection"
-            );
-        });
-    });
-}
-
+// NOTE: the legacy `restored_inprogress_parent_defers_delivery_until_success`
+// test was removed during the merge with the rewritten streamer: the new
+// eligibility predicate gates SSE on consumer-presence + role rather than
+// status, so an InProgress / Success transition no longer drives delivery.
+// Equivalent coverage of the consumer / role gate lives in this file's
+// other tests and in `active_agent_views_model_tests.rs`.
 #[test]
 fn handle_event_batch_persists_max_seq_to_history_model() {
     use crate::ai::agent::conversation::{AIConversation, AIConversationId};
@@ -541,14 +462,23 @@ fn finish_restore_fetch_reconnects_sse_when_children_added_to_open_connection() 
 
         // Seed the state on_restored_conversations would have set up, then
         // inject a fake open SSE connection (generation 0) simulating the
-        // race: a status transition fired before the restore fetch completed.
+        // race: a consumer registered before the restore fetch completed.
+        // The dummy `EntityId` stands in for any local consumer (e.g. an
+        // open agent view); without it the eligibility predicate would
+        // bail and reconnect_sse would tear the connection down instead
+        // of opening a new one.
         let (_, rx) = futures::channel::mpsc::unbounded::<SseStreamItem>();
+        let consumer_id = warpui::EntityId::new();
         poller.update(&mut app, |me, _| {
             me.event_cursor.insert(conversation_id, 0);
             me.watched_run_ids
                 .entry(conversation_id)
                 .or_default()
                 .insert(own_run_id.to_string());
+            me.consumers
+                .entry(conversation_id)
+                .or_default()
+                .insert(consumer_id);
             me.sse_connections.insert(
                 conversation_id,
                 SseConnectionState {
