@@ -75,7 +75,7 @@ pub(super) struct ResponsesRequestBody {
     pub(super) model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) reasoning: Option<ResponsesReasoningConfig>,
-    pub(super) instructions: &'static str,
+    pub(super) instructions: String,
     pub(super) input: Vec<Value>,
     pub(super) tools: Vec<Value>,
     pub(super) tool_choice: &'static str,

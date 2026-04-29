@@ -13,7 +13,9 @@ use super::tool_schemas::built_in_tool_schema;
 use super::types::{
     ParsedFunctionCall, ResponsesErrorEnvelope, ResponsesReasoningConfig, ResponsesRequestBody,
 };
-use super::{conversation_state_store, ProviderError, RequestParams, LOCAL_OPENAI_SYSTEM_PROMPT};
+use super::{
+    build_local_openai_system_prompt, conversation_state_store, ProviderError, RequestParams,
+};
 use crate::ai::agent::api::r#impl::get_supported_tools;
 
 /// Starts a local Responses event stream after recording the new request inputs in conversation state.
@@ -51,9 +53,9 @@ pub(super) async fn start_local_responses_eventsource(
         let (normalized_model, reasoning) =
             normalize_openai_model_and_reasoning(&params.model.to_string());
         ResponsesRequestBody {
+            instructions: build_local_openai_system_prompt(&normalized_model),
             model: normalized_model,
             reasoning,
-            instructions: LOCAL_OPENAI_SYSTEM_PROMPT,
             input: state.items,
             tools: build_tools_payload(params),
             tool_choice: "auto",

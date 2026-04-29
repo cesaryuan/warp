@@ -142,6 +142,14 @@ fn normalize_openai_model_and_reasoning_extracts_effort_for_gpt_5_5() {
     );
 }
 
+/// Verifies that the rendered local OpenAI prompt includes the actual request model name.
+#[test]
+fn build_local_openai_system_prompt_injects_model_name() {
+    let prompt = build_local_openai_system_prompt("qwen3:32b");
+    assert!(prompt.contains(r#"You are powered by the "qwen3:32b" model."#));
+    assert!(!prompt.contains("__LOCAL_OPENAI_MODEL__"));
+}
+
 /// Verifies that base GPT numeric variants are normalized without inventing a reasoning effort.
 #[test]
 fn normalize_openai_model_and_reasoning_preserves_base_variant() {
