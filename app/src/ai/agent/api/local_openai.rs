@@ -146,6 +146,10 @@ pub fn generate_local_openai_responses_output(
             return;
         };
 
+        if should_emit_create_task(&params) {
+            yield Ok(create_task_event(&task_id));
+        }
+
         let request_future = {
             let server_api = server_api.clone();
             let params = params.clone();
@@ -1221,6 +1225,35 @@ fn add_messages_event(task_id: &TaskId, messages: Vec<api::Message>) -> api::Res
     }
 }
 
+/// Builds a `CreateTask` client action event so the local root task is upgraded before messages arrive.
+fn create_task_event(task_id: &TaskId) -> api::ResponseEvent {
+    api::ResponseEvent {
+        r#type: Some(api::response_event::Type::ClientActions(
+            api::response_event::ClientActions {
+                actions: vec![api::ClientAction {
+                    action: Some(api::client_action::Action::CreateTask(
+                        api::client_action::CreateTask {
+                            task: Some(api::Task {
+                                id: task_id.to_string(),
+                                messages: vec![],
+                                dependencies: None,
+                                description: String::new(),
+                                summary: String::new(),
+                                server_data: String::new(),
+                            }),
+                        },
+                    )),
+                }],
+            },
+        )),
+    }
+}
+
+/// Returns whether the local backend should emit a `CreateTask` action for this request.
+fn should_emit_create_task(params: &RequestParams) -> bool {
+    params.conversation_token.is_none()
+}
+
 /// Builds a user-visible error message event so the UI never gets stuck without output.
 fn user_visible_error_event(
     task_id: &TaskId,
@@ -1300,9 +1333,56 @@ impl std::error::Error for ProviderError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::agent::conversation::AIConversationId;
+    use crate::ai::agent::task::TaskId;
     use crate::ai::agent::AIAgentActionResult;
     use crate::ai::agent::AIAgentContext;
+    use crate::ai::blocklist::SessionContext;
+    use crate::ai::llms::{LLMId, LLMProvider};
     use ai::agent::action_result::{AIAgentActionResultType, ReadFilesResult};
+    use warp_multi_agent_api as api;
+
+    /// Builds a minimal RequestParams instance for local backend tests.
+    fn request_params_for_local_backend_tests() -> RequestParams {
+        let model = LLMId::from("gpt-5-4-low");
+        RequestParams {
+            conversation_id: AIConversationId::new(),
+            input: vec![],
+            target_task_id: Some(TaskId::new("task-id".to_string())),
+            conversation_token: None,
+            forked_from_conversation_token: None,
+            ambient_agent_task_id: None,
+            tasks: vec![],
+            existing_suggestions: None,
+            metadata: None,
+            session_context: SessionContext::new_for_test(),
+            model: model.clone(),
+            coding_model: model.clone(),
+            cli_agent_model: model.clone(),
+            computer_use_model: model,
+            is_memory_enabled: false,
+            warp_drive_context_enabled: false,
+            mcp_context: None,
+            planning_enabled: true,
+            should_redact_secrets: false,
+            api_keys: None,
+            allow_use_of_warp_credits_with_byok: false,
+            local_openai_responses_backend_enabled: true,
+            local_openai_api_key: None,
+            local_openai_base_url: None,
+            model_provider: LLMProvider::OpenAI,
+            autonomy_level: api::AutonomyLevel::Supervised,
+            isolation_level: api::IsolationLevel::None,
+            web_search_enabled: false,
+            computer_use_enabled: false,
+            ask_user_question_enabled: false,
+            research_agent_enabled: false,
+            orchestration_enabled: false,
+            supported_tools_override: None,
+            parent_agent_id: None,
+            agent_name: None,
+        }
+    }
 
     /// Verifies that a base URL without `/v1` is normalized correctly.
     #[test]
@@ -1362,6 +1442,24 @@ mod tests {
         let (model, reasoning) = normalize_openai_model_and_reasoning("gpt-5-5");
         assert_eq!(model, "gpt-5.5");
         assert!(reasoning.is_none());
+    }
+
+    /// Verifies that the local backend upgrades the optimistic task on the first turn.
+    #[test]
+    fn should_emit_create_task_for_first_turn() {
+        let mut params = request_params_for_local_backend_tests();
+        params.conversation_token = None;
+        assert!(should_emit_create_task(&params));
+    }
+
+    /// Verifies that follow-up turns reuse the existing task without re-emitting CreateTask.
+    #[test]
+    fn should_not_emit_create_task_for_follow_up_turn() {
+        let mut params = request_params_for_local_backend_tests();
+        params.conversation_token = Some(crate::ai::agent::api::ServerConversationToken::new(
+            "conversation-token".to_string(),
+        ));
+        assert!(!should_emit_create_task(&params));
     }
 
     /// Verifies that user queries and tool outputs map to Responses input items.
