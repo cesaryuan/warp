@@ -387,34 +387,60 @@ pub(super) fn normalize_responses_endpoint(base_url: &str) -> String {
     }
 }
 
-/// Normalizes Warp-style OpenAI GPT numeric model IDs and extracts a Responses reasoning effort when present.
+/// Normalizes OpenAI-compatible model IDs and extracts a Responses reasoning effort when present.
 pub(super) fn normalize_openai_model_and_reasoning(
     model_id: &str,
 ) -> (String, Option<ResponsesReasoningConfig>) {
-    let parts = model_id.split('-').collect::<Vec<_>>();
-    if parts.len() == 4
-        && parts[0] == "gpt"
-        && parts[1].chars().all(|c| c.is_ascii_digit())
-        && parts[2].chars().all(|c| c.is_ascii_digit())
-        && is_supported_reasoning_effort(parts[3])
-    {
+    let (base_model_id, reasoning) = split_openai_reasoning_suffix(model_id);
+    if let Some(normalized_model) = normalize_openai_model_base(base_model_id) {
+        return (normalized_model, reasoning);
+    }
+
+    (model_id.to_string(), None)
+}
+
+/// Splits a supported Responses reasoning effort suffix from the provided model ID.
+fn split_openai_reasoning_suffix(model_id: &str) -> (&str, Option<ResponsesReasoningConfig>) {
+    let Some((base_model_id, effort)) = model_id.rsplit_once('-') else {
+        return (model_id, None);
+    };
+    if is_supported_reasoning_effort(effort) {
         return (
-            format!("gpt-{}.{}", parts[1], parts[2]),
+            base_model_id,
             Some(ResponsesReasoningConfig {
-                effort: parts[3].to_string(),
+                effort: effort.to_string(),
             }),
         );
     }
 
+    (model_id, None)
+}
+
+/// Normalizes the base model ID into the exact Responses API model name when we recognize it.
+fn normalize_openai_model_base(model_id: &str) -> Option<String> {
+    let parts = model_id.split('-').collect::<Vec<_>>();
     if parts.len() == 3
         && parts[0] == "gpt"
         && parts[1].chars().all(|c| c.is_ascii_digit())
         && parts[2].chars().all(|c| c.is_ascii_digit())
     {
-        return (format!("gpt-{}.{}", parts[1], parts[2]), None);
+        return Some(format!("gpt-{}.{}", parts[1], parts[2]));
     }
 
-    (model_id.to_string(), None)
+    if parts.len() == 4
+        && parts[0] == "gpt"
+        && parts[1].chars().all(|c| c.is_ascii_digit())
+        && parts[2].chars().all(|c| c.is_ascii_digit())
+        && parts[3] == "codex"
+    {
+        return Some(format!("gpt-{}.{}-codex", parts[1], parts[2]));
+    }
+
+    if matches!(model_id, "gpt-5.2" | "gpt-5.2-codex" | "gpt-5.3-codex") {
+        return Some(model_id.to_string());
+    }
+
+    None
 }
 
 /// Returns whether the provided suffix is a Responses reasoning effort we can forward directly.

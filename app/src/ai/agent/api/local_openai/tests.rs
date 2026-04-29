@@ -142,6 +142,45 @@ fn normalize_openai_model_and_reasoning_extracts_effort_for_gpt_5_5() {
     );
 }
 
+/// Verifies that dotted GPT-5.2 reasoning variants preserve the exact Responses model name.
+#[test]
+fn normalize_openai_model_and_reasoning_extracts_effort_for_gpt_5_2() {
+    let (model, reasoning) = normalize_openai_model_and_reasoning("gpt-5.2-low");
+    assert_eq!(model, "gpt-5.2");
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .map(|reasoning| reasoning.effort.as_str()),
+        Some("low")
+    );
+}
+
+/// Verifies that GPT-5.2 Codex reasoning variants preserve the exact Responses model name.
+#[test]
+fn normalize_openai_model_and_reasoning_extracts_effort_for_gpt_5_2_codex() {
+    let (model, reasoning) = normalize_openai_model_and_reasoning("gpt-5.2-codex-low");
+    assert_eq!(model, "gpt-5.2-codex");
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .map(|reasoning| reasoning.effort.as_str()),
+        Some("low")
+    );
+}
+
+/// Verifies that GPT-5.3 Codex reasoning variants preserve the exact Responses model name.
+#[test]
+fn normalize_openai_model_and_reasoning_extracts_effort_for_gpt_5_3_codex() {
+    let (model, reasoning) = normalize_openai_model_and_reasoning("gpt-5.3-codex-low");
+    assert_eq!(model, "gpt-5.3-codex");
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .map(|reasoning| reasoning.effort.as_str()),
+        Some("low")
+    );
+}
+
 /// Verifies that the rendered local OpenAI prompt includes the actual request model name.
 #[test]
 fn build_local_openai_system_prompt_injects_model_name() {
@@ -163,6 +202,22 @@ fn normalize_openai_model_and_reasoning_preserves_base_variant() {
 fn normalize_openai_model_and_reasoning_preserves_gpt_5_5_base_variant() {
     let (model, reasoning) = normalize_openai_model_and_reasoning("gpt-5-5");
     assert_eq!(model, "gpt-5.5");
+    assert!(reasoning.is_none());
+}
+
+/// Verifies that base GPT-5.2 Codex variants are preserved without inventing a reasoning effort.
+#[test]
+fn normalize_openai_model_and_reasoning_preserves_gpt_5_2_codex_base_variant() {
+    let (model, reasoning) = normalize_openai_model_and_reasoning("gpt-5.2-codex");
+    assert_eq!(model, "gpt-5.2-codex");
+    assert!(reasoning.is_none());
+}
+
+/// Verifies that base GPT-5.3 Codex variants are preserved without inventing a reasoning effort.
+#[test]
+fn normalize_openai_model_and_reasoning_preserves_gpt_5_3_codex_base_variant() {
+    let (model, reasoning) = normalize_openai_model_and_reasoning("gpt-5.3-codex");
+    assert_eq!(model, "gpt-5.3-codex");
     assert!(reasoning.is_none());
 }
 
