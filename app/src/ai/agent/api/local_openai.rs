@@ -10,7 +10,9 @@ use async_stream::stream;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures::channel::oneshot;
 use futures::future::{select, Either};
+use futures::StreamExt as _;
 use parking_lot::FairMutex;
+use reqwest_eventsource::Event as EventSourceEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -42,15 +44,17 @@ struct LocalConversationState {
 }
 
 /// Parsed subset of a Responses API payload used by the local backend.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ResponsesApiResponse {
     #[serde(default)]
     output: Vec<ResponsesOutputItem>,
 }
 
 /// Parsed subset of a single Responses API output item.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ResponsesOutputItem {
+    #[serde(default)]
+    id: Option<String>,
     #[serde(rename = "type")]
     item_type: String,
     #[serde(default)]
@@ -66,7 +70,7 @@ struct ResponsesOutputItem {
 }
 
 /// Parsed subset of a message content item returned by Responses.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ResponsesContentItem {
     #[serde(rename = "type")]
     item_type: String,
@@ -105,12 +109,64 @@ struct ResponsesRequestBody {
     input: Vec<Value>,
     tools: Vec<Value>,
     tool_choice: &'static str,
+    stream: bool,
 }
 
 /// Reasoning configuration supported by the Responses API.
 #[derive(Debug, Clone, Serialize)]
 struct ResponsesReasoningConfig {
     effort: String,
+}
+
+/// Tracks streamed assistant text for a single Responses output item.
+#[derive(Debug, Clone)]
+struct StreamingTextMessageState {
+    message_id: String,
+    text: String,
+}
+
+/// Tracks streamed function call arguments for a single Responses tool call.
+#[derive(Debug, Default, Clone)]
+struct StreamingFunctionCallState {
+    name: Option<String>,
+    arguments: String,
+}
+
+/// Aggregates streaming state until the Responses stream completes.
+#[derive(Debug, Default)]
+struct StreamingResponsesAccumulator {
+    text_messages_by_item_id: HashMap<String, StreamingTextMessageState>,
+    emitted_text_item_ids: Vec<String>,
+    function_calls_by_call_id: HashMap<String, StreamingFunctionCallState>,
+    emitted_function_call_ids: Vec<String>,
+}
+
+/// Minimal typed view over a streamed text delta event.
+#[derive(Debug, Deserialize)]
+struct ResponsesTextDeltaEvent {
+    item_id: String,
+    delta: String,
+}
+
+/// Minimal typed view over a streamed function call arguments delta event.
+#[derive(Debug, Deserialize)]
+struct ResponsesFunctionCallArgumentsDeltaEvent {
+    call_id: String,
+    delta: String,
+}
+
+/// Minimal typed view over a streamed function call arguments done event.
+#[derive(Debug, Deserialize)]
+struct ResponsesFunctionCallArgumentsDoneEvent {
+    call_id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Minimal typed view over a streamed completed event.
+#[derive(Debug, Deserialize)]
+struct ResponsesCompletedEvent {
+    response: ResponsesApiResponse,
 }
 
 /// Returns the global in-memory state used to preserve local conversation history.
@@ -154,48 +210,127 @@ pub fn generate_local_openai_responses_output(
             yield Ok(create_task_event(&task_id));
         }
 
-        let request_future = {
-            let server_api = server_api.clone();
-            let params = params.clone();
-            let task_id = task_id.clone();
-            let request_id = request_id.clone();
-            async move {
-                execute_local_responses_request(&server_api, &params, &task_id, &request_id).await
+        let mut response_stream = match start_local_responses_eventsource(&server_api, &params).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                log::warn!("Local OpenAI Responses backend failed before streaming began: {error:#}");
+                yield Ok(user_visible_error_event(
+                    &task_id,
+                    &request_id,
+                    &error.to_string(),
+                ));
+                yield Ok(stream_finished_event(
+                    finished_reason_for_error(&error, model_name),
+                ));
+                return;
             }
         };
-        match select(Box::pin(request_future), Box::pin(cancellation_rx)).await {
-            Either::Left((result, _)) => {
-                match result {
-                    Ok(output_events) => {
-                        for event in output_events {
-                            yield event;
+
+        let mut accumulator = StreamingResponsesAccumulator::default();
+        let mut cancellation_future = Box::pin(cancellation_rx);
+        let mut stream_finished = false;
+
+        loop {
+            let next_event_future = Box::pin(response_stream.next());
+            match select(next_event_future, cancellation_future).await {
+                Either::Left((next_event, next_cancellation_future)) => {
+                    cancellation_future = next_cancellation_future;
+                    let Some(next_event) = next_event else {
+                        break;
+                    };
+
+                    match next_event {
+                        Ok(EventSourceEvent::Open) => {
+                            log::debug!("Opened local OpenAI Responses stream");
+                        }
+                        Ok(EventSourceEvent::Message(message)) => {
+                            match handle_responses_stream_message(
+                                &params,
+                                &task_id,
+                                &request_id,
+                                &message.event,
+                                &message.data,
+                                &mut accumulator,
+                            ) {
+                                Ok(stream_result) => {
+                                    for event in stream_result.events {
+                                        yield event;
+                                    }
+                                    if stream_result.is_terminal {
+                                        stream_finished = true;
+                                        break;
+                                    }
+                                }
+                                Err(error) => {
+                                    log::warn!("Failed to process local OpenAI Responses stream message: {error:#}");
+                                    yield Ok(user_visible_error_event(
+                                        &task_id,
+                                        &request_id,
+                                        &error.to_string(),
+                                    ));
+                                    yield Ok(stream_finished_event(
+                                        finished_reason_for_error(&error, model_name.clone()),
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            let error = stream_error_to_anyhow(err).await;
+                            log::warn!("Local OpenAI Responses backend stream error: {error:#}");
+                            yield Ok(user_visible_error_event(
+                                &task_id,
+                                &request_id,
+                                &error.to_string(),
+                            ));
+                            yield Ok(stream_finished_event(
+                                finished_reason_for_error(&error, model_name.clone()),
+                            ));
+                            return;
                         }
                     }
-                    Err(error) => {
-                        log::warn!("Local OpenAI Responses backend failed: {error:#}");
-                        yield Ok(user_visible_error_event(
-                            &task_id,
-                            &request_id,
-                            &error.to_string(),
-                        ));
-                        yield Ok(stream_finished_event(
-                            finished_reason_for_error(&error, model_name),
-                        ));
-                    }
+                }
+                Either::Right((_cancelled, _pending_event_future)) => {
+                    log::debug!("Cancelled local OpenAI Responses stream");
+                    return;
                 }
             }
-            Either::Right((_cancelled, _)) => {}
+        }
+
+        if !stream_finished {
+            match finalize_stream_state(&params, accumulator, &request_id, None) {
+                Ok(events) => {
+                    for event in events {
+                        yield event;
+                    }
+                }
+                Err(error) => {
+                    log::warn!("Failed to finalize local OpenAI Responses stream state: {error:#}");
+                    yield Ok(user_visible_error_event(
+                        &task_id,
+                        &request_id,
+                        &error.to_string(),
+                    ));
+                    yield Ok(stream_finished_event(
+                        finished_reason_for_error(&error, model_name.clone()),
+                    ));
+                    return;
+                }
+            }
+            yield Ok(stream_finished_event(
+                api::response_event::stream_finished::Reason::Done(
+                    api::response_event::stream_finished::Done {},
+                ),
+            ));
         }
     })
 }
 
-/// Executes a single local Responses API turn and converts it into Warp ResponseEvents.
-async fn execute_local_responses_request(
+/// Starts a local Responses event stream after recording the new request inputs in conversation state.
+async fn start_local_responses_eventsource(
     server_api: &ServerApi,
     params: &RequestParams,
-    task_id: &TaskId,
-    request_id: &str,
-) -> anyhow::Result<Vec<Event>> {
+) -> anyhow::Result<http_client::EventSourceStream> {
     let api_key = params
         .local_openai_api_key
         .as_ref()
@@ -232,71 +367,33 @@ async fn execute_local_responses_request(
             input: state.items,
             tools: build_tools_payload(params),
             tool_choice: "auto",
+            stream: true,
         }
     };
 
-    let response = server_api
+    Ok(server_api
         .http_client()
         .post(endpoint)
         .bearer_auth(api_key)
         .json(&request_body)
-        .send()
-        .await
-        .context("Failed to send local OpenAI Responses request")?;
+        .eventsource())
+}
 
-    let status = response.status();
-    if !status.is_success() {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown provider error".to_string());
-        let provider_message = serde_json::from_str::<ResponsesErrorEnvelope>(&error_text)
-            .map(|body| body.error.message)
-            .unwrap_or(error_text);
-        return Err(anyhow!(ProviderError::new(
-            status.as_u16(),
-            provider_message
-        )));
+/// Converts an SSE stream error into the closest local backend error shape we can expose.
+async fn stream_error_to_anyhow(err: reqwest_eventsource::Error) -> anyhow::Error {
+    match err {
+        reqwest_eventsource::Error::InvalidStatusCode(status, response) => {
+            let response_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown provider error".to_string());
+            let provider_message = serde_json::from_str::<ResponsesErrorEnvelope>(&response_text)
+                .map(|body| body.error.message)
+                .unwrap_or(response_text);
+            anyhow!(ProviderError::new(status.as_u16(), provider_message))
+        }
+        other => anyhow!("Failed to read local OpenAI Responses stream: {other}"),
     }
-
-    let response: ResponsesApiResponse = response
-        .json()
-        .await
-        .context("Failed to decode local OpenAI Responses payload")?;
-    let (assistant_messages, function_calls) = parse_responses_output(response.output)?;
-
-    let mut history_items = assistant_messages
-        .iter()
-        .map(|text| assistant_output_item(text))
-        .collect::<Vec<_>>();
-    history_items.extend(function_calls.iter().map(function_call_history_item));
-    if !history_items.is_empty() {
-        let mut state_store = conversation_state_store().lock();
-        let state = state_store.entry(params.conversation_id).or_default();
-        state.items.extend(history_items);
-    }
-
-    let mut messages = assistant_messages
-        .into_iter()
-        .map(|text| agent_output_message(task_id, request_id, text))
-        .collect::<Vec<_>>();
-    messages.extend(
-        function_calls
-            .into_iter()
-            .map(|tool_call| tool_call_message(task_id, request_id, tool_call))
-            .collect::<anyhow::Result<Vec<_>>>()?,
-    );
-
-    let mut events = Vec::new();
-    if !messages.is_empty() {
-        events.push(Ok(add_messages_event(task_id, messages)));
-    }
-    events.push(Ok(stream_finished_event(
-        api::response_event::stream_finished::Reason::Done(
-            api::response_event::stream_finished::Done {},
-        ),
-    )));
-    Ok(events)
 }
 
 /// Converts the current request inputs into Responses API conversation items.
@@ -638,6 +735,317 @@ fn parse_responses_output(
     Ok((assistant_messages, function_calls))
 }
 
+/// Result of translating a single streamed Responses SSE message into Warp client events.
+#[derive(Debug, Default)]
+struct StreamMessageResult {
+    events: Vec<Event>,
+    is_terminal: bool,
+}
+
+/// Translates a streamed Responses SSE message into Warp client events and updates stream state.
+fn handle_responses_stream_message(
+    params: &RequestParams,
+    task_id: &TaskId,
+    request_id: &str,
+    event_name: &str,
+    data: &str,
+    accumulator: &mut StreamingResponsesAccumulator,
+) -> anyhow::Result<StreamMessageResult> {
+    let payload = serde_json::from_str::<Value>(data)
+        .with_context(|| format!("Failed to decode streamed Responses event payload: {data}"))?;
+    let event_type = streamed_event_type(event_name, &payload);
+
+    match event_type.as_str() {
+        "response.output_text.delta" | "response.text.delta" => {
+            let delta_event: ResponsesTextDeltaEvent = serde_json::from_value(payload)?;
+            let Some(event) =
+                handle_streamed_text_delta(task_id, request_id, accumulator, delta_event)?
+            else {
+                return Ok(StreamMessageResult::default());
+            };
+
+            Ok(StreamMessageResult {
+                events: vec![Ok(event)],
+                is_terminal: false,
+            })
+        }
+        "response.function_call_arguments.delta" => {
+            let delta_event: ResponsesFunctionCallArgumentsDeltaEvent =
+                serde_json::from_value(payload)?;
+            accumulator
+                .function_calls_by_call_id
+                .entry(delta_event.call_id)
+                .or_default()
+                .arguments
+                .push_str(&delta_event.delta);
+            Ok(StreamMessageResult::default())
+        }
+        "response.function_call_arguments.done" => {
+            let done_event: ResponsesFunctionCallArgumentsDoneEvent =
+                serde_json::from_value(payload)?;
+            let function_call = finalize_streamed_function_call(accumulator, done_event)?;
+            Ok(StreamMessageResult {
+                events: vec![Ok(add_messages_event(
+                    task_id,
+                    vec![tool_call_message(task_id, request_id, function_call)?],
+                ))],
+                is_terminal: false,
+            })
+        }
+        "response.completed" => {
+            let completed_event: ResponsesCompletedEvent = serde_json::from_value(payload)?;
+            Ok(StreamMessageResult {
+                events: finalize_stream_state(
+                    params,
+                    std::mem::take(accumulator),
+                    request_id,
+                    Some(completed_event.response),
+                )?,
+                is_terminal: true,
+            })
+        }
+        "response.failed" | "error" => {
+            let message = streamed_error_message(&payload);
+            let error = anyhow!("Local OpenAI Responses stream failed: {message}");
+            Ok(StreamMessageResult {
+                events: vec![
+                    Ok(user_visible_error_event(
+                        task_id,
+                        request_id,
+                        &error.to_string(),
+                    )),
+                    Ok(stream_finished_event(finished_reason_for_error(
+                        &error,
+                        params.model.to_string(),
+                    ))),
+                ],
+                is_terminal: true,
+            })
+        }
+        _ => Ok(StreamMessageResult::default()),
+    }
+}
+
+/// Creates or appends to a streamed assistant text message based on a Responses text delta.
+fn handle_streamed_text_delta(
+    task_id: &TaskId,
+    request_id: &str,
+    accumulator: &mut StreamingResponsesAccumulator,
+    delta_event: ResponsesTextDeltaEvent,
+) -> anyhow::Result<Option<api::ResponseEvent>> {
+    if delta_event.delta.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(existing_message) = accumulator
+        .text_messages_by_item_id
+        .get_mut(&delta_event.item_id)
+    {
+        existing_message.text.push_str(&delta_event.delta);
+        return Ok(Some(update_agent_output_text_event(
+            task_id,
+            request_id,
+            &existing_message.message_id,
+            existing_message.text.clone(),
+        )));
+    }
+
+    let message_id = Uuid::new_v4().to_string();
+    accumulator
+        .emitted_text_item_ids
+        .push(delta_event.item_id.clone());
+    accumulator.text_messages_by_item_id.insert(
+        delta_event.item_id,
+        StreamingTextMessageState {
+            message_id: message_id.clone(),
+            text: delta_event.delta.clone(),
+        },
+    );
+
+    Ok(Some(add_messages_event(
+        task_id,
+        vec![agent_output_message_with_id(
+            message_id,
+            task_id,
+            request_id,
+            delta_event.delta,
+        )],
+    )))
+}
+
+/// Finalizes a streamed function call and returns the parsed Warp tool call payload.
+fn finalize_streamed_function_call(
+    accumulator: &mut StreamingResponsesAccumulator,
+    done_event: ResponsesFunctionCallArgumentsDoneEvent,
+) -> anyhow::Result<ParsedFunctionCall> {
+    let state = accumulator
+        .function_calls_by_call_id
+        .entry(done_event.call_id.clone())
+        .or_default();
+    state.name = Some(done_event.name.clone());
+    let final_arguments = if done_event.arguments.is_empty() {
+        state.arguments.clone()
+    } else {
+        done_event.arguments.clone()
+    };
+    state.arguments = final_arguments.clone();
+    accumulator
+        .emitted_function_call_ids
+        .push(done_event.call_id.clone());
+
+    Ok(ParsedFunctionCall {
+        name: done_event.name,
+        call_id: done_event.call_id,
+        arguments: serde_json::from_str(&final_arguments)
+            .context("Failed to parse streamed function call arguments")?,
+    })
+}
+
+/// Finalizes stream state, backfills any non-streamed outputs, and records conversation history.
+fn finalize_stream_state(
+    params: &RequestParams,
+    accumulator: StreamingResponsesAccumulator,
+    request_id: &str,
+    completed_response: Option<ResponsesApiResponse>,
+) -> anyhow::Result<Vec<Event>> {
+    let mut events = Vec::new();
+
+    if let Some(response) = completed_response {
+        let output = response.output;
+        let (assistant_messages, function_calls) = parse_responses_output(output.clone())?;
+        let mut history_items = assistant_messages
+            .iter()
+            .map(|text| assistant_output_item(text))
+            .collect::<Vec<_>>();
+        history_items.extend(function_calls.iter().map(function_call_history_item));
+        if !history_items.is_empty() {
+            let mut state_store = conversation_state_store().lock();
+            let state = state_store.entry(params.conversation_id).or_default();
+            state.items.extend(history_items);
+        }
+
+        let backfill_messages = build_backfill_messages(
+            &accumulator,
+            params.target_task_id.as_ref(),
+            request_id,
+            output,
+        )?;
+        if let Some(task_id) = params.target_task_id.as_ref() {
+            if !backfill_messages.is_empty() {
+                events.push(Ok(add_messages_event(task_id, backfill_messages)));
+            }
+        }
+    }
+
+    events.push(Ok(stream_finished_event(
+        api::response_event::stream_finished::Reason::Done(
+            api::response_event::stream_finished::Done {},
+        ),
+    )));
+    Ok(events)
+}
+
+/// Builds fallback messages for any completed outputs that were not already streamed to the UI.
+fn build_backfill_messages(
+    accumulator: &StreamingResponsesAccumulator,
+    task_id: Option<&TaskId>,
+    request_id: &str,
+    output: Vec<ResponsesOutputItem>,
+) -> anyhow::Result<Vec<api::Message>> {
+    let Some(task_id) = task_id else {
+        return Ok(Vec::new());
+    };
+
+    let mut messages = Vec::new();
+    for item in output {
+        match item.item_type.as_str() {
+            "message" if item.role.as_deref() == Some("assistant") => {
+                let Some(item_id) = item.id.as_ref() else {
+                    continue;
+                };
+                if accumulator
+                    .emitted_text_item_ids
+                    .iter()
+                    .any(|existing_id| existing_id == item_id)
+                {
+                    continue;
+                }
+
+                let text = item
+                    .content
+                    .iter()
+                    .filter(|content| content.item_type == "output_text")
+                    .filter_map(|content| content.text.clone())
+                    .collect::<String>();
+                if !text.is_empty() {
+                    messages.push(agent_output_message(task_id, request_id, text));
+                }
+            }
+            "function_call" => {
+                let Some(call_id) = item.call_id.as_ref() else {
+                    continue;
+                };
+                if accumulator
+                    .emitted_function_call_ids
+                    .iter()
+                    .any(|existing_id| existing_id == call_id)
+                {
+                    continue;
+                }
+
+                let Some(name) = item.name.clone() else {
+                    continue;
+                };
+                let arguments = item.arguments.unwrap_or_else(|| "{}".to_string());
+                messages.push(tool_call_message(
+                    task_id,
+                    request_id,
+                    ParsedFunctionCall {
+                        name,
+                        call_id: call_id.clone(),
+                        arguments: serde_json::from_str(&arguments)
+                            .context("Failed to parse backfilled function call arguments")?,
+                    },
+                )?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(messages)
+}
+
+/// Resolves the canonical event type for a streamed SSE message.
+fn streamed_event_type(event_name: &str, payload: &Value) -> String {
+    if !event_name.is_empty() {
+        return event_name.to_string();
+    }
+
+    payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Extracts the most useful error message from a streamed Responses failure payload.
+fn streamed_error_message(payload: &Value) -> String {
+    if let Some(message) = payload.get("message").and_then(Value::as_str) {
+        return message.to_string();
+    }
+
+    if let Some(message) = payload
+        .get("error")
+        .and_then(Value::as_object)
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+    {
+        return message.to_string();
+    }
+
+    payload.to_string()
+}
+
 /// Converts a parsed Responses function call into a Warp tool call message.
 fn tool_call_message(
     task_id: &TaskId,
@@ -663,8 +1071,18 @@ fn tool_call_message(
 
 /// Converts assistant text into a Warp agent output message.
 fn agent_output_message(task_id: &TaskId, request_id: &str, text: String) -> api::Message {
+    agent_output_message_with_id(Uuid::new_v4().to_string(), task_id, request_id, text)
+}
+
+/// Converts assistant text into a Warp agent output message with a stable message ID.
+fn agent_output_message_with_id(
+    message_id: String,
+    task_id: &TaskId,
+    request_id: &str,
+    text: String,
+) -> api::Message {
     api::Message {
-        id: Uuid::new_v4().to_string(),
+        id: message_id,
         task_id: task_id.to_string(),
         server_message_data: String::new(),
         citations: vec![],
@@ -673,6 +1091,37 @@ fn agent_output_message(task_id: &TaskId, request_id: &str, text: String) -> api
         )),
         request_id: request_id.to_string(),
         timestamp: None,
+    }
+}
+
+/// Builds an update client action that replaces an existing streamed assistant text message.
+fn update_agent_output_text_event(
+    task_id: &TaskId,
+    request_id: &str,
+    message_id: &str,
+    full_text: String,
+) -> api::ResponseEvent {
+    api::ResponseEvent {
+        r#type: Some(api::response_event::Type::ClientActions(
+            api::response_event::ClientActions {
+                actions: vec![api::ClientAction {
+                    action: Some(api::client_action::Action::UpdateTaskMessage(
+                        api::client_action::UpdateTaskMessage {
+                            task_id: task_id.to_string(),
+                            message: Some(agent_output_message_with_id(
+                                message_id.to_string(),
+                                task_id,
+                                request_id,
+                                full_text,
+                            )),
+                            mask: Some(prost_types::FieldMask {
+                                paths: vec!["agent_output.text".to_string()],
+                            }),
+                        },
+                    )),
+                }],
+            },
+        )),
     }
 }
 
@@ -1634,6 +2083,49 @@ mod tests {
         assert!(run_shell_schema["parameters"]["properties"]["risk_category"].is_object());
     }
 
+    /// Verifies that streaming text deltas update the existing agent output field.
+    #[test]
+    fn update_agent_output_text_event_replaces_text() {
+        let task_id = TaskId::new("task-id".to_string());
+        let initial_message = agent_output_message_with_id(
+            "message-id".to_string(),
+            &task_id,
+            "request-id",
+            "hello".to_string(),
+        );
+        let update_event = update_agent_output_text_event(
+            &task_id,
+            "request-id",
+            "message-id",
+            "hello world".to_string(),
+        );
+
+        let Some(api::response_event::Type::ClientActions(actions)) = update_event.r#type else {
+            panic!("expected client actions");
+        };
+        let Some(api::client_action::Action::UpdateTaskMessage(update)) =
+            actions.actions[0].action.as_ref()
+        else {
+            panic!("expected update action");
+        };
+        let merged = field_mask::FieldMaskOperation::update(
+            &api::MESSAGE_DESCRIPTOR,
+            &initial_message,
+            update
+                .message
+                .as_ref()
+                .expect("update message should exist"),
+            update.mask.clone().expect("update mask should exist"),
+        )
+        .apply()
+        .expect("update should succeed");
+
+        let Some(api::message::Message::AgentOutput(agent_output)) = merged.message else {
+            panic!("expected agent output message");
+        };
+        assert_eq!(agent_output.text, "hello world");
+    }
+
     /// Verifies that tools with optional parameters are exposed with strict mode disabled.
     #[test]
     fn tools_with_optional_fields_disable_strict_mode() {
@@ -1722,6 +2214,7 @@ mod tests {
     fn parse_responses_output_extracts_text_and_function_calls() {
         let output = vec![
             ResponsesOutputItem {
+                id: Some("msg_1".to_string()),
                 item_type: "message".to_string(),
                 role: Some("assistant".to_string()),
                 content: vec![ResponsesContentItem {
@@ -1733,6 +2226,7 @@ mod tests {
                 arguments: None,
             },
             ResponsesOutputItem {
+                id: Some("fc_1".to_string()),
                 item_type: "function_call".to_string(),
                 role: None,
                 content: vec![],
