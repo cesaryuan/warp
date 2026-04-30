@@ -9,7 +9,7 @@ use warp_multi_agent_api as api;
 
 use crate::ai::agent::task::TaskId;
 
-use super::request::{assistant_output_item, function_call_history_item};
+use super::request::{assistant_output_item, function_call_history_item, reasoning_history_item};
 use super::tool_calls::parse_tool_call;
 use super::types::{
     ParsedFunctionCall, ResponsesApiResponse, ResponsesCompletedEvent,
@@ -23,59 +23,6 @@ use super::{
     add_messages_event, conversation_state_store, finished_reason_for_error, stream_finished_event,
     user_visible_error_event, Event, RequestParams,
 };
-
-/// Parses the assistant output returned by the Responses API into text and tool calls.
-pub(super) fn parse_responses_output(
-    output: Vec<ResponsesOutputItem>,
-) -> anyhow::Result<(Vec<String>, Vec<ParsedFunctionCall>)> {
-    let mut assistant_messages = Vec::new();
-    let mut function_calls = Vec::new();
-
-    for item in output {
-        match item.item_type.as_str() {
-            "message" if item.role.as_deref() == Some("assistant") => {
-                let text = item
-                    .content
-                    .into_iter()
-                    .filter(|content| matches!(content.item_type.as_str(), "output_text" | "text"))
-                    .filter_map(|content| content.text)
-                    .collect::<Vec<_>>()
-                    .join("");
-                if !text.is_empty() {
-                    assistant_messages.push(text);
-                }
-            }
-            "function_call" => {
-                let name = item.name.context("Missing function call name")?;
-                let call_id = item
-                    .call_id
-                    .or(item.id)
-                    .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
-                let arguments = item
-                    .arguments
-                    .as_deref()
-                    .map(serde_json::from_str)
-                    .transpose()
-                    .context("Failed to parse function call arguments")?
-                    .unwrap_or_else(|| json!({}));
-                function_calls.push(ParsedFunctionCall {
-                    name,
-                    call_id,
-                    arguments,
-                });
-            }
-            _ => {}
-        }
-    }
-
-    if assistant_messages.is_empty() && function_calls.is_empty() {
-        return Err(anyhow!(
-            "Local OpenAI Responses output contained no assistant messages or tool calls"
-        ));
-    }
-
-    Ok((assistant_messages, function_calls))
-}
 
 /// Translates a streamed Responses SSE message into Warp client events and updates stream state.
 pub(super) fn handle_responses_stream_message(
@@ -608,19 +555,11 @@ pub(super) fn finalize_stream_state(
         let history_items = if output.is_empty() {
             history_items_from_accumulator(&accumulator)?
         } else {
-            match parse_responses_output(output.clone()) {
-                Ok((assistant_messages, function_calls)) => {
-                    if assistant_messages.is_empty()
-                        && function_calls.is_empty()
-                        && has_streamed_output(&accumulator)
-                    {
+            match history_items_from_completed_output(output.clone()) {
+                Ok(history_items) => {
+                    if history_items.is_empty() && has_streamed_output(&accumulator) {
                         history_items_from_accumulator(&accumulator)?
                     } else {
-                        let mut history_items = assistant_messages
-                            .iter()
-                            .map(|text| assistant_output_item(text))
-                            .collect::<Vec<_>>();
-                        history_items.extend(function_calls.iter().map(function_call_history_item));
                         history_items
                     }
                 }
@@ -703,6 +642,57 @@ fn history_items_from_accumulator(
     }
 
     Ok(items)
+}
+
+/// Converts completed Responses output items into replayable history while preserving reasoning context.
+fn history_items_from_completed_output(
+    output: Vec<ResponsesOutputItem>,
+) -> anyhow::Result<Vec<Value>> {
+    let mut history_items = Vec::new();
+
+    for item in output {
+        match item.item_type.as_str() {
+            "message" if item.role.as_deref() == Some("assistant") => {
+                let text = item
+                    .content
+                    .iter()
+                    .filter(|content| matches!(content.item_type.as_str(), "output_text" | "text"))
+                    .filter_map(|content| content.text.clone())
+                    .collect::<Vec<_>>()
+                    .join("");
+                if !text.is_empty() {
+                    history_items.push(assistant_output_item(&text));
+                }
+            }
+            "reasoning" => {
+                if let Some(reasoning_item) = reasoning_history_item(&item) {
+                    history_items.push(reasoning_item);
+                }
+            }
+            "function_call" => {
+                let name = item.name.context("Missing function call name")?;
+                let call_id = item
+                    .call_id
+                    .or(item.id)
+                    .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+                let arguments = item
+                    .arguments
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .context("Failed to parse function call arguments")?
+                    .unwrap_or_else(|| json!({}));
+                history_items.push(function_call_history_item(&ParsedFunctionCall {
+                    name,
+                    call_id,
+                    arguments,
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(history_items)
 }
 
 /// Builds fallback messages for any completed outputs that were not already streamed to the UI.

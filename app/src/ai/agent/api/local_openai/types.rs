@@ -35,6 +35,8 @@ pub(super) struct ResponsesOutputItem {
     #[serde(default)]
     pub(super) summary: Vec<ResponsesReasoningSummaryPart>,
     #[serde(default)]
+    pub(super) encrypted_content: Option<String>,
+    #[serde(default)]
     pub(super) name: Option<String>,
     #[serde(default)]
     pub(super) call_id: Option<String>,
@@ -87,6 +89,8 @@ pub(super) struct ResponsesRequestBody {
     pub(super) model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) reasoning: Option<ResponsesReasoningConfig>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) include: Vec<String>,
     pub(super) instructions: String,
     pub(super) input: Vec<Value>,
     pub(super) tools: Vec<Value>,

@@ -11,7 +11,7 @@ use super::request::{
 };
 use super::stream::{
     agent_output_message_with_id, finalize_stream_state, finalize_streamed_function_call,
-    handle_responses_stream_message, handle_streamed_output_item_done, parse_responses_output,
+    handle_responses_stream_message, handle_streamed_output_item_done,
     update_agent_output_text_event,
 };
 use super::tool_calls::parse_read_file;
@@ -414,6 +414,10 @@ fn prepare_local_responses_request_configures_parallel_tool_calls_and_store_poli
         request_body["reasoning"]["summary"],
         serde_json::json!("auto")
     );
+    assert_eq!(
+        request_body["include"],
+        serde_json::json!(["reasoning.encrypted_content"])
+    );
 }
 
 /// Verifies that streaming text deltas update the existing agent output field.
@@ -560,6 +564,7 @@ fn finalize_stream_state_backfills_reasoning_messages_from_completed_output() {
                         item_type: "summary_text".to_string(),
                         text: Some("Checked the repository wiring first.".to_string()),
                     }],
+                    encrypted_content: Some("enc_reasoning_payload".to_string()),
                     name: None,
                     call_id: None,
                     arguments: None,
@@ -573,6 +578,7 @@ fn finalize_stream_state_backfills_reasoning_messages_from_completed_output() {
                         text: Some("Done".to_string()),
                     }],
                     summary: vec![],
+                    encrypted_content: None,
                     name: None,
                     call_id: None,
                     arguments: None,
@@ -605,6 +611,20 @@ fn finalize_stream_state_backfills_reasoning_messages_from_completed_output() {
         "Checked the repository wiring first."
     );
     assert!(reasoning_message.finished_duration.is_some());
+    let stored_items = conversation_state_store()
+        .lock()
+        .get(&params.conversation_id)
+        .cloned()
+        .expect("conversation state should exist")
+        .items;
+    let reasoning_item = stored_items
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .expect("expected stored reasoning history item");
+    assert_eq!(
+        reasoning_item["encrypted_content"],
+        serde_json::json!("enc_reasoning_payload")
+    );
 
     conversation_state_store()
         .lock()
@@ -682,6 +702,7 @@ fn streamed_function_calls_use_output_item_done_to_get_real_call_id() {
             role: None,
             content: vec![],
             summary: vec![],
+            encrypted_content: None,
             name: Some("file_glob".to_string()),
             call_id: Some("call_real_123".to_string()),
             arguments: Some(r#"{"path":"."}"#.to_string()),
@@ -726,6 +747,7 @@ fn streamed_function_calls_wait_for_output_item_name() {
             role: None,
             content: vec![],
             summary: vec![],
+            encrypted_content: None,
             name: Some("file_glob".to_string()),
             call_id: Some("call_real_456".to_string()),
             arguments: Some(r#"{"path":"."}"#.to_string()),
@@ -758,6 +780,7 @@ fn streamed_function_calls_fall_back_to_item_id_when_output_item_has_no_call_id(
             role: None,
             content: vec![],
             summary: vec![],
+            encrypted_content: None,
             name: Some("file_glob".to_string()),
             call_id: None,
             arguments: Some(r#"{"path":"."}"#.to_string()),
@@ -993,41 +1016,6 @@ fn task_history_response_items_restore_prior_messages() {
     assert_eq!(items[2]["call_id"], "call_1");
     assert_eq!(items[3]["role"], "assistant");
     assert_eq!(items[3]["content"][0]["text"], "prior answer");
-}
-
-/// Verifies that message text and function calls are extracted from Responses output.
-#[test]
-fn parse_responses_output_extracts_text_and_function_calls() {
-    let output = vec![
-        ResponsesOutputItem {
-            id: Some("msg_1".to_string()),
-            item_type: "message".to_string(),
-            role: Some("assistant".to_string()),
-            content: vec![ResponsesContentItem {
-                item_type: "output_text".to_string(),
-                text: Some("done".to_string()),
-            }],
-            summary: vec![],
-            name: None,
-            call_id: None,
-            arguments: None,
-        },
-        ResponsesOutputItem {
-            id: Some("fc_1".to_string()),
-            item_type: "function_call".to_string(),
-            role: None,
-            content: vec![],
-            summary: vec![],
-            name: Some("read_files".to_string()),
-            call_id: Some("call_1".to_string()),
-            arguments: Some(r#"{"files":[{"name":"README.md"}]}"#.to_string()),
-        },
-    ];
-
-    let (messages, calls) = parse_responses_output(output).expect("output should parse");
-    assert_eq!(messages, vec!["done".to_string()]);
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "read_files");
 }
 
 /// Verifies that transient provider status codes are retried by the local backend.

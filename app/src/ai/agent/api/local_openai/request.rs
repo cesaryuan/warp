@@ -15,7 +15,8 @@ use crate::server::server_api::ServerApi;
 
 use super::tool_schemas::built_in_tool_schema;
 use super::types::{
-    ParsedFunctionCall, ResponsesErrorEnvelope, ResponsesReasoningConfig, ResponsesRequestBody,
+    ParsedFunctionCall, ResponsesErrorEnvelope, ResponsesOutputItem, ResponsesReasoningConfig,
+    ResponsesRequestBody,
 };
 use super::{
     build_local_openai_system_prompt, conversation_state_store, ProviderError, RequestParams,
@@ -67,6 +68,7 @@ pub(super) fn prepare_local_responses_request(
             instructions: build_local_openai_system_prompt(&normalized_model),
             model: normalized_model,
             reasoning,
+            include: responses_include_fields(),
             input: state.items,
             tools: build_tools_payload(params),
             tool_choice: "auto",
@@ -81,6 +83,11 @@ pub(super) fn prepare_local_responses_request(
         endpoint,
         request_body,
     })
+}
+
+/// Returns the extra Responses fields Warp needs preserved across stateless turns.
+fn responses_include_fields() -> Vec<String> {
+    vec!["reasoning.encrypted_content".to_string()]
 }
 
 /// Opens a local Responses event stream from a prepared request payload.
@@ -417,6 +424,57 @@ pub(super) fn function_call_history_item(function_call: &ParsedFunctionCall) -> 
         "name": function_call.name,
         "arguments": function_call.arguments.to_string(),
     })
+}
+
+/// Converts a reasoning output item into a replayable history item when encrypted context is present.
+pub(super) fn reasoning_history_item(item: &ResponsesOutputItem) -> Option<Value> {
+    let encrypted_content = item.encrypted_content.as_deref()?;
+    let mut history_item = serde_json::Map::new();
+    history_item.insert("type".to_string(), Value::String("reasoning".to_string()));
+    history_item.insert(
+        "encrypted_content".to_string(),
+        Value::String(encrypted_content.to_string()),
+    );
+
+    if let Some(id) = item.id.as_ref().filter(|id| !id.is_empty()) {
+        history_item.insert("id".to_string(), Value::String(id.clone()));
+    }
+
+    if !item.summary.is_empty() {
+        history_item.insert(
+            "summary".to_string(),
+            Value::Array(
+                item.summary
+                    .iter()
+                    .map(|part| {
+                        json!({
+                            "type": part.item_type,
+                            "text": part.text,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+
+    if !item.content.is_empty() {
+        history_item.insert(
+            "content".to_string(),
+            Value::Array(
+                item.content
+                    .iter()
+                    .map(|part| {
+                        json!({
+                            "type": part.item_type,
+                            "text": part.text,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+
+    Some(Value::Object(history_item))
 }
 
 /// Converts a completed tool result into a Responses `function_call_output` item.
