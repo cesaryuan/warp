@@ -5,8 +5,9 @@ use ai::agent::action_result::{AIAgentActionResultType, ReadFilesResult};
 use warp_multi_agent_api as api;
 
 use super::request::{
-    build_tools_payload, convert_inputs_to_response_items, mcp_tool_schema,
-    normalize_openai_model_and_reasoning, normalize_responses_endpoint,
+    build_tools_payload, convert_inputs_to_response_items, convert_inputs_to_task_messages,
+    mcp_tool_schema, normalize_openai_model_and_reasoning, normalize_responses_endpoint,
+    task_history_response_items,
 };
 use super::stream::{
     agent_output_message_with_id, finalize_stream_state, finalize_streamed_function_call,
@@ -258,6 +259,27 @@ fn build_tools_payload_includes_mcp_tools() {
             .as_str()
             .is_some_and(|name| name.starts_with("warp_mcp_tool__"))
     }));
+}
+
+/// Verifies that supported-tools overrides are respected when building local tool payloads.
+#[test]
+fn build_tools_payload_respects_supported_tools_override() {
+    let mut params = request_params_for_local_backend_tests();
+    params.supported_tools_override = Some(vec![api::ToolType::SuggestPrompt]);
+
+    let payload = build_tools_payload(&params);
+    assert_eq!(payload.len(), 1);
+    assert_eq!(payload[0]["name"], "suggest_prompt");
+}
+
+/// Verifies that unsupported override tools are omitted rather than silently broadening the payload.
+#[test]
+fn build_tools_payload_omits_unsupported_override_tools() {
+    let mut params = request_params_for_local_backend_tests();
+    params.supported_tools_override = Some(vec![api::ToolType::Subagent]);
+
+    let payload = build_tools_payload(&params);
+    assert!(payload.is_empty());
 }
 
 /// Verifies that built-in tool schemas now carry parameter descriptions.
@@ -574,6 +596,147 @@ fn convert_inputs_to_response_items_supports_user_query_and_action_result() {
     assert_eq!(items.len(), 2);
     assert_eq!(items[0]["role"], "user");
     assert_eq!(items[1]["type"], "function_call_output");
+}
+
+/// Verifies that local request inputs are mirrored into persisted task messages for restore.
+#[test]
+fn convert_inputs_to_task_messages_supports_user_query_and_action_result() {
+    let task_id = TaskId::new("task".to_string());
+    let request_id = "request-123";
+    let inputs = vec![
+        AIAgentInput::UserQuery {
+            query: "hello".to_string(),
+            context: std::sync::Arc::new([AIAgentContext::SelectedText("world".to_string())]),
+            static_query_type: None,
+            referenced_attachments: std::collections::HashMap::new(),
+            user_query_mode: crate::ai::agent::UserQueryMode::Normal,
+            running_command: None,
+            intended_agent: None,
+        },
+        AIAgentInput::ActionResult {
+            result: AIAgentActionResult {
+                id: "call_123".to_string().into(),
+                task_id: task_id.clone(),
+                result: AIAgentActionResultType::ReadFiles(ReadFilesResult::Error(
+                    "missing".to_string(),
+                )),
+            },
+            context: std::sync::Arc::new([]),
+        },
+    ];
+
+    let messages = convert_inputs_to_task_messages(&inputs, &task_id, request_id)
+        .expect("inputs should convert into task messages");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].task_id, task_id.to_string());
+    assert_eq!(messages[0].request_id, request_id);
+    assert!(matches!(
+        messages[0].message,
+        Some(api::message::Message::UserQuery(_))
+    ));
+    assert!(matches!(
+        messages[1].message,
+        Some(api::message::Message::ToolCallResult(_))
+    ));
+}
+
+/// Verifies that persisted task history seeds local Responses input items for conversation resumes.
+#[test]
+fn task_history_response_items_restore_prior_messages() {
+    let mut params = request_params_for_local_backend_tests();
+    params.tasks = vec![api::Task {
+        id: params
+            .target_task_id
+            .as_ref()
+            .expect("task id should exist")
+            .to_string(),
+        messages: vec![
+            api::Message {
+                id: "message-user".to_string(),
+                task_id: "task-id".to_string(),
+                server_message_data: String::new(),
+                citations: vec![],
+                request_id: "request-1".to_string(),
+                timestamp: None,
+                message: Some(api::message::Message::UserQuery(api::message::UserQuery {
+                    query: "prior question".to_string(),
+                    context: None,
+                    referenced_attachments: std::collections::HashMap::new(),
+                    mode: None,
+                    intended_agent: Default::default(),
+                })),
+            },
+            api::Message {
+                id: "message-tool".to_string(),
+                task_id: "task-id".to_string(),
+                server_message_data: String::new(),
+                citations: vec![],
+                request_id: "request-1".to_string(),
+                timestamp: None,
+                message: Some(api::message::Message::ToolCall(api::message::ToolCall {
+                    tool_call_id: "call_1".to_string(),
+                    tool: Some(api::message::tool_call::Tool::ReadFiles(
+                        api::message::tool_call::ReadFiles {
+                            files: vec![api::message::tool_call::read_files::File {
+                                name: "README.md".to_string(),
+                                line_ranges: vec![],
+                            }],
+                        },
+                    )),
+                })),
+            },
+            api::Message {
+                id: "message-result".to_string(),
+                task_id: "task-id".to_string(),
+                server_message_data: String::new(),
+                citations: vec![],
+                request_id: "request-1".to_string(),
+                timestamp: None,
+                message: Some(api::message::Message::ToolCallResult(
+                    api::message::ToolCallResult {
+                        tool_call_id: "call_1".to_string(),
+                        context: None,
+                        result: Some(api::message::tool_call_result::Result::ReadFiles(
+                            api::ReadFilesResult {
+                                result: Some(api::read_files_result::Result::Error(
+                                    api::read_files_result::Error {
+                                        message: "missing".to_string(),
+                                    },
+                                )),
+                            },
+                        )),
+                    },
+                )),
+            },
+            api::Message {
+                id: "message-output".to_string(),
+                task_id: "task-id".to_string(),
+                server_message_data: String::new(),
+                citations: vec![],
+                request_id: "request-1".to_string(),
+                timestamp: None,
+                message: Some(api::message::Message::AgentOutput(
+                    api::message::AgentOutput {
+                        text: "prior answer".to_string(),
+                    },
+                )),
+            },
+        ],
+        dependencies: None,
+        description: String::new(),
+        summary: String::new(),
+        server_data: String::new(),
+    }];
+
+    let items = task_history_response_items(&params).expect("task history should convert");
+    assert_eq!(items.len(), 4);
+    assert_eq!(items[0]["role"], "user");
+    assert_eq!(items[1]["type"], "function_call");
+    assert_eq!(items[1]["name"], "read_files");
+    assert_eq!(items[2]["type"], "function_call_output");
+    assert_eq!(items[2]["call_id"], "call_1");
+    assert_eq!(items[3]["role"], "assistant");
+    assert_eq!(items[3]["content"][0]["text"], "prior answer");
 }
 
 /// Verifies that message text and function calls are extracted from Responses output.

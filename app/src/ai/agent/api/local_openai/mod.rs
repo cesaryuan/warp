@@ -26,7 +26,9 @@ use crate::ai::agent::task::TaskId;
 use crate::server::server_api::ServerApi;
 
 use super::{Event, RequestParams, ResponseStream};
-use request::{start_local_responses_eventsource, stream_error_to_anyhow};
+use request::{
+    convert_inputs_to_task_messages, start_local_responses_eventsource, stream_error_to_anyhow,
+};
 use stream::handle_responses_stream_message;
 use types::{LocalConversationState, StreamingResponsesAccumulator};
 
@@ -330,6 +332,18 @@ pub fn generate_local_openai_responses_output(
 
         if should_emit_create_task(&params) {
             yield Ok(create_task_event(&task_id));
+        }
+
+        match convert_inputs_to_task_messages(&params.input, &task_id, &request_id) {
+            Ok(input_messages) if !input_messages.is_empty() => {
+                yield Ok(add_messages_event(&task_id, input_messages));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                log::warn!(
+                    "Failed to mirror local OpenAI request inputs into persisted task history: {error:#}"
+                );
+            }
         }
 
         let mut response_stream = match start_local_responses_eventsource(&server_api, &params).await {

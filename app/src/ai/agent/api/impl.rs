@@ -10,11 +10,22 @@ use crate::server::server_api::ServerApi;
 use super::local_openai::generate_local_openai_responses_output;
 use super::{convert_to::convert_input, ConvertToAPITypeError, RequestParams, ResponseStream};
 
+/// Redacts secrets in request inputs when the current request is configured to do so.
+pub(super) fn redact_request_inputs_if_needed(params: &mut RequestParams) {
+    if params.should_redact_secrets {
+        redaction::redact_inputs(&mut params.input);
+    }
+}
+
 pub async fn generate_multi_agent_output(
     server_api: Arc<ServerApi>,
     mut params: RequestParams,
     cancellation_rx: futures::channel::oneshot::Receiver<()>,
 ) -> Result<ResponseStream, ConvertToAPITypeError> {
+    // Redact user-provided secrets before choosing either backend so local
+    // OpenAI-compatible requests honor the same privacy guarantees.
+    redact_request_inputs_if_needed(&mut params);
+
     if should_use_local_openai_responses_backend(&params) {
         return Ok(generate_local_openai_responses_output(
             server_api,
@@ -54,10 +65,6 @@ pub async fn generate_multi_agent_output(
                 )),
             },
         );
-    }
-
-    if params.should_redact_secrets {
-        redaction::redact_inputs(&mut params.input);
     }
 
     let mut api_keys = params.api_keys;
