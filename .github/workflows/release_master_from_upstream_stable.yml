@@ -61,7 +61,7 @@ on:
         description: Runner label for Windows jobs.
         required: true
         type: string
-        default: windows-latest-large
+        default: windows-latest
       runner_macos:
         description: Runner label for macOS jobs.
         required: true
@@ -151,6 +151,6 @@ jobs:
       runner_linux_x86: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_linux_x86 || 'ubuntu-latest' }}
       runner_linux_arm: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_linux_arm || 'ubuntu-24.04-arm' }}
       runner_web: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_web || 'ubuntu-22.04' }}
-      runner_windows: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_windows || 'windows-latest-large' }}
+      runner_windows: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_windows || 'windows-latest' }}
       bundle_features: nld_onnx_model
     secrets: inherit
