@@ -32,13 +32,16 @@
 
 This fork is a modded build of Warp aimed at relaxing some upstream restrictions around BYOK and OpenAI-compatible integrations.
 
-## Current Modifications
+## Key Features
 
 This fork currently includes the following custom changes on top of upstream Warp:
 
 * BYOK (Bring Your Own API Key) is enabled for all users instead of being limited by the original billing-gated behavior.
 * Warp Agent can use a custom OpenAI-compatible `base URL`, making it easier to connect to self-hosted gateways, proxies, or third-party compatible providers.
 * When the local OpenAI-compatible backend is enabled, Warp Agent requests can be sent directly from the client to the configured `/v1/responses` endpoint instead of going through Warp's hosted `/ai/multi-agent` service.
+* The local OpenAI-compatible backend now supports reasoning/thinking summaries in the Warp UI, including streaming updates and the final `Thought for N seconds` style duration display.
+* Multi-turn local OpenAI-compatible sessions now preserve reasoning context more accurately by carrying forward reasoning items, including encrypted reasoning content required by the Responses API for continued tool-using and reasoning flows.
+* This branch has also been refreshed with the latest upstream Warp changes from the recent `byok` and `master` merges, so it keeps the custom BYOK/OpenAI-compatible behavior while staying aligned with newer upstream fixes and maintenance updates.
 
 ## Installation
 
