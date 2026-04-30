@@ -4,9 +4,9 @@ on:
   schedule:
     # Forks cannot subscribe to upstream release events directly, so poll daily.
     - cron: "15 8 * * *"
-  push:
-    branches:
-      - master
+  # push:
+  #   branches:
+  #     - master
   workflow_dispatch:
     inputs:
       mode:
