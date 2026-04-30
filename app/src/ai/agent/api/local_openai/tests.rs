@@ -7,7 +7,7 @@ use warp_multi_agent_api as api;
 use super::request::{
     build_tools_payload, convert_inputs_to_response_items, convert_inputs_to_task_messages,
     mcp_tool_schema, normalize_openai_model_and_reasoning, normalize_responses_endpoint,
-    task_history_response_items,
+    prepare_local_responses_request, task_history_response_items,
 };
 use super::stream::{
     agent_output_message_with_id, finalize_stream_state, finalize_streamed_function_call,
@@ -19,13 +19,13 @@ use super::types::{
     ResponsesOutputItem, StreamingResponsesAccumulator, StreamingTextMessageState,
 };
 use super::*;
-use crate::ai::agent::conversation::AIConversationId;
-use crate::ai::agent::task::TaskId;
 use crate::ai::agent::AIAgentActionResult;
 use crate::ai::agent::AIAgentContext;
 use crate::ai::agent::AIAgentInput;
 use crate::ai::agent::MCPContext;
 use crate::ai::agent::MCPServer;
+use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::agent::task::TaskId;
 use crate::ai::blocklist::SessionContext;
 use crate::ai::llms::{LLMId, LLMProvider};
 
@@ -313,6 +313,22 @@ fn run_shell_command_schema_includes_proto_risk_fields() {
     );
     assert!(run_shell_schema["parameters"]["properties"]["uses_pager"].is_object());
     assert!(run_shell_schema["parameters"]["properties"]["risk_category"].is_object());
+}
+
+/// Verifies that local Responses requests explicitly opt into provider-side parallel tool calls.
+#[test]
+fn prepare_local_responses_request_enables_parallel_tool_calls() {
+    let mut params = request_params_for_local_backend_tests();
+    params.local_openai_api_key = Some("test-key".to_string());
+    params.local_openai_base_url = Some("https://example.com".to_string());
+
+    let prepared_request =
+        prepare_local_responses_request(&params).expect("request should prepare successfully");
+    let request_body = serde_json::to_value(&prepared_request.request_body)
+        .expect("request body should serialize");
+
+    assert_eq!(request_body["parallel_tool_calls"], serde_json::json!(true));
+    assert_eq!(request_body["tool_choice"], serde_json::json!("auto"));
 }
 
 /// Verifies that streaming text deltas update the existing agent output field.

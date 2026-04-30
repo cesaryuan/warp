@@ -3,9 +3,9 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::anyhow;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use prost::Message as _;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 use warp_multi_agent_api as api;
 
@@ -18,7 +18,7 @@ use super::types::{
     ParsedFunctionCall, ResponsesErrorEnvelope, ResponsesReasoningConfig, ResponsesRequestBody,
 };
 use super::{
-    build_local_openai_system_prompt, conversation_state_store, ProviderError, RequestParams,
+    ProviderError, RequestParams, build_local_openai_system_prompt, conversation_state_store,
 };
 use crate::ai::agent::api::r#impl::get_supported_tools;
 
@@ -70,6 +70,7 @@ pub(super) fn prepare_local_responses_request(
             input: state.items,
             tools: build_tools_payload(params),
             tool_choice: "auto",
+            parallel_tool_calls: true,
             stream: true,
         }
     };
