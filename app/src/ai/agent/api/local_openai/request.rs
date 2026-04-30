@@ -22,11 +22,17 @@ use super::{
 };
 use crate::ai::agent::api::r#impl::get_supported_tools;
 
-/// Starts a local Responses event stream after recording the new request inputs in conversation state.
-pub(super) async fn start_local_responses_eventsource(
-    server_api: &ServerApi,
+/// Prepared request data that can be reused across bounded local backend retries.
+pub(super) struct PreparedLocalResponsesRequest {
+    pub(super) api_key: String,
+    pub(super) endpoint: String,
+    pub(super) request_body: ResponsesRequestBody,
+}
+
+/// Prepares a local Responses request after recording the new inputs in conversation state once.
+pub(super) fn prepare_local_responses_request(
     params: &RequestParams,
-) -> anyhow::Result<http_client::EventSourceStream> {
+) -> anyhow::Result<PreparedLocalResponsesRequest> {
     let api_key = params
         .local_openai_api_key
         .as_ref()
@@ -68,11 +74,23 @@ pub(super) async fn start_local_responses_eventsource(
         }
     };
 
+    Ok(PreparedLocalResponsesRequest {
+        api_key,
+        endpoint,
+        request_body,
+    })
+}
+
+/// Opens a local Responses event stream from a prepared request payload.
+pub(super) async fn open_local_responses_eventsource(
+    server_api: &ServerApi,
+    prepared_request: &PreparedLocalResponsesRequest,
+) -> anyhow::Result<http_client::EventSourceStream> {
     Ok(server_api
         .http_client()
-        .post(endpoint)
-        .bearer_auth(api_key)
-        .json(&request_body)
+        .post(prepared_request.endpoint.clone())
+        .bearer_auth(prepared_request.api_key.clone())
+        .json(&prepared_request.request_body)
         .eventsource())
 }
 

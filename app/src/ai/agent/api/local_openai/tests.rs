@@ -771,3 +771,47 @@ fn parse_responses_output_extracts_text_and_function_calls() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "read_files");
 }
+
+/// Verifies that transient provider status codes are retried by the local backend.
+#[test]
+fn local_backend_retries_transient_provider_errors() {
+    let transient_statuses = [408_u16, 429_u16, 500_u16, 503_u16];
+
+    for status in transient_statuses {
+        let error = anyhow::anyhow!(ProviderError::new(status, "retry me".to_string()));
+        assert!(
+            is_retryable_local_backend_error(&error),
+            "status {status} should be retryable"
+        );
+        assert!(should_retry_local_backend_error(&error, 1, false));
+    }
+}
+
+/// Verifies that permanent provider status codes fail fast instead of retrying.
+#[test]
+fn local_backend_does_not_retry_permanent_provider_errors() {
+    let permanent_statuses = [400_u16, 401_u16, 403_u16, 404_u16];
+
+    for status in permanent_statuses {
+        let error = anyhow::anyhow!(ProviderError::new(status, "do not retry".to_string()));
+        assert!(
+            !is_retryable_local_backend_error(&error),
+            "status {status} should not be retryable"
+        );
+        assert!(!should_retry_local_backend_error(&error, 1, false));
+    }
+}
+
+/// Verifies that retries stop once output has started or the attempt budget is exhausted.
+#[test]
+fn local_backend_retry_stops_after_output_or_max_attempts() {
+    let error = anyhow::anyhow!("connection reset");
+
+    assert!(should_retry_local_backend_error(&error, 1, false));
+    assert!(!should_retry_local_backend_error(
+        &error,
+        MAX_ATTEMPTS,
+        false
+    ));
+    assert!(!should_retry_local_backend_error(&error, 1, true));
+}
