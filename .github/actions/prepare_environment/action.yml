@@ -200,7 +200,7 @@ runs:
     - name: Install protoc via winget (fallback for Windows)
       if: ${{ inputs.target_os == 'windows' && steps.install_protoc.outcome == 'failure' }}
       shell: pwsh
-      run: winget install Google.Protobuf
+      run: winget install Google.Protobuf --force
 
     - name: Fail if protoc install did not succeed
       if: ${{ inputs.target_os != 'windows' && steps.install_protoc.outcome == 'failure' }}
