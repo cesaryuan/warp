@@ -180,13 +180,17 @@ Write-Output "Built for $ARCH with executable at $BINARY_PATH"
 # Prepare bundled resources
 $BUNDLED_RESOURCES_DIR = "$CARGO_TARGET_OUTPUT_DIR\resources"
 Write-Output "Preparing bundled resources..."
+$PrepareResourcesStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 & "$WINDOWS_INSTALLER_DIR\prepare_bundled_resources.ps1" -DestinationDir "$BUNDLED_RESOURCES_DIR" -Channel "$CHANNEL" -CargoProfile "$CARGO_PROFILE"
+$PrepareResourcesStopwatch.Stop()
 if (-Not $?) {
     Write-Error "Failed to prepare bundled resources"
     exit 1
 }
+Write-Output "Prepared bundled resources in $($PrepareResourcesStopwatch.Elapsed)"
 
 Write-Output 'Building Warp installer'
+$InstallerStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $ISCC_ARGS = @(
     "$WINDOWS_INSTALLER_DIR\windows-installer.iss",
     "/DReleaseChannel=$CHANNEL",
@@ -206,10 +210,12 @@ if ($SIGN_TOOL_CMD) {
     $ISCC_ARGS += "/Scodesign=$SIGN_TOOL_CMD"
 }
 & ISCC @ISCC_ARGS
+$InstallerStopwatch.Stop()
 if (-Not $?) {
     Write-Error "Failed to build $APP_NAME installer"
     exit 1
 }
+Write-Output "Built Warp installer in $($InstallerStopwatch.Elapsed)"
 
 # If this is being run within a GitHub action, set an output variable with the
 # location of the installer so it can be referenced by subsequent actions.
