@@ -22,27 +22,20 @@ runs:
   using: composite
   steps:
     - name: Make GitHub token available in the environment
-      if: ${{ inputs.target_os != 'windows' }}
       shell: bash
       run: echo "GH_TOKEN=${{ github.token }}" >> $GITHUB_ENV
 
-    - name: Make GitHub token available in the environment (Windows)
-      if: ${{ inputs.target_os == 'windows' }}
-      shell: pwsh
-      run: '"GH_TOKEN=${{ github.token }}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
-
     - name: Set up git for Windows
       if: ${{ inputs.target_os == 'windows' }}
-      shell: pwsh
+      shell: bash
       run: git config --system core.longpaths true
 
     - name: Set CARGO_HOME location
       if: ${{ inputs.target_os == 'windows' }}
-      shell: pwsh
-      run: '"CARGO_HOME=C:\cargo" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+      shell: bash
+      run: echo "CARGO_HOME=C:\cargo" >> $GITHUB_ENV
 
     - name: Determine repository root
-      if: ${{ inputs.target_os != 'windows' }}
       id: repo-root
       shell: bash
       run: |
@@ -59,22 +52,6 @@ runs:
         else
           echo "is-workspace-root=false" >> $GITHUB_OUTPUT
         fi
-
-    - name: Determine repository root (Windows)
-      if: ${{ inputs.target_os == 'windows' }}
-      id: repo-root-windows
-      shell: pwsh
-      run: |
-        # The action lives at <repo-root>/.github/actions/prepare_environment.
-        # Derive the repository root from the action path.
-        $repoRoot = (Resolve-Path (Join-Path "${{ github.action_path }}" "..\..\..")).Path
-        "path=$repoRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-        $workspace = (Resolve-Path $env:GITHUB_WORKSPACE).Path
-        if ($repoRoot -eq $workspace) {
-          "is-workspace-root=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-        } else {
-          "is-workspace-root=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-        }
 
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       if: ${{ inputs.is_self_hosted != 'true' && !startsWith(runner.name, 'nsc-runner') }}
@@ -110,7 +87,6 @@ runs:
         ssh-private-key: ${{ inputs.ssh_key }}
 
     - name: Install dependencies
-      if: ${{ inputs.target_os != 'windows' }}
       shell: bash
       run: |
         cd "${{ steps.repo-root.outputs.path }}"
@@ -151,40 +127,15 @@ runs:
           exit 1
         fi
 
-    - name: Install dependencies (Windows)
-      if: ${{ inputs.target_os == 'windows' }}
-      shell: pwsh
-      run: |
-        Set-Location "${{ steps.repo-root-windows.outputs.path }}"
-        if ('${{ inputs.is_self_hosted }}' -eq 'true') {
-          if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-            throw "cargo was not found on the self-hosted Windows runner. Install Rust and ensure cargo is on PATH."
-          }
-          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
-            throw "rustup was not found on the self-hosted Windows runner. Install Rustup and ensure it is on PATH."
-          }
-          if ('${{ inputs.install_release_deps }}' -eq 'true') {
-            cargo install --locked cargo-about@0.8.4
-          }
-        } else {
-          ./script/windows/install_build_deps.ps1
-        }
-
     - name: Install Node
       uses: actions/setup-node@3235b876344d2a9aa001b8d1453c930bba69e610 # v3.9.1
       with:
         node-version: 20.9.0
 
     - name: Enable Corepack
-      if: ${{ inputs.target_os != 'windows' }}
       # Enables NodeJS's Corepack tool, which is necessary to use the right version of `yarn` to
       # build TS command signatures.
       shell: bash
-      run: corepack enable
-
-    - name: Enable Corepack (Windows)
-      if: ${{ inputs.target_os == 'windows' }}
-      shell: pwsh
       run: corepack enable
 
     - name: Install protoc for generating rust bindings of protobuf APIs

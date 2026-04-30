@@ -1578,7 +1578,7 @@ jobs:
         with:
           target_os: windows
           cache_key: ${{ matrix.arch }}
-          is_self_hosted: ${{ runner.environment == 'self-hosted' }}
+          is_self_hosted: false
           ref: ${{ needs.prepare_release.outputs.release_branch }}
           install_release_deps: true
           ssh_key: ${{ secrets.WARP_CHANNEL_CONFIG_ACCESS_SSH_KEY }}
@@ -1586,7 +1586,7 @@ jobs:
       - name: Add arm64 target
         if: ${{ matrix.arch == 'arm64' }}
         run: rustup target add aarch64-pc-windows-msvc
-        shell: pwsh
+        shell: bash
 
       - name: Get channel configuration
         id: get-config
@@ -1598,16 +1598,12 @@ jobs:
       - name: Build binary
         id: build_binary
         run: |
-          $bundleArgs = @(
-            '-Channel', "$env:CHANNEL",
-            '-skip_build_installer',
-            '--arch', "${{ matrix.arch }}"
-          )
-          if ('${{ inputs.bundle_features }}' -ne '') {
-            $bundleArgs += @('-features', '${{ inputs.bundle_features }}')
-          }
-          & ./script/windows/bundle.ps1 @bundleArgs
-        shell: pwsh
+          BUNDLE_ARGS=(-Channel "$CHANNEL" -skip_build_installer --arch "${{ matrix.arch }}")
+          if [[ -n "${{ inputs.bundle_features }}" ]]; then
+            BUNDLE_ARGS+=(-features "${{ inputs.bundle_features }}")
+          fi
+          script/bundle "${BUNDLE_ARGS[@]}"
+        shell: bash
         env:
           CHANNEL: ${{ steps.get-config.outputs.channel }}
           GIT_RELEASE_TAG: ${{ needs.prepare_release.outputs.release_tag }}
@@ -1662,16 +1658,12 @@ jobs:
       - name: Bundle app
         id: bundle_app
         run: |
-          $bundleArgs = @(
-            '-Channel', "$env:CHANNEL",
-            '-skip_build_binary',
-            '--arch', "${{ matrix.arch }}"
-          )
-          if ('${{ inputs.bundle_features }}' -ne '') {
-            $bundleArgs += @('-features', '${{ inputs.bundle_features }}')
-          }
-          & ./script/windows/bundle.ps1 @bundleArgs
-        shell: pwsh
+          BUNDLE_ARGS=(-Channel "$CHANNEL" -skip_build_binary --arch "${{ matrix.arch }}")
+          if [[ -n "${{ inputs.bundle_features }}" ]]; then
+            BUNDLE_ARGS+=(-features "${{ inputs.bundle_features }}")
+          fi
+          script/bundle "${BUNDLE_ARGS[@]}"
+        shell: bash
         env:
           CHANNEL: ${{ steps.get-config.outputs.channel }}
           GIT_RELEASE_TAG: ${{ needs.prepare_release.outputs.release_tag }}
