@@ -11,21 +11,23 @@ use super::request::{
 };
 use super::stream::{
     agent_output_message_with_id, finalize_stream_state, finalize_streamed_function_call,
-    handle_streamed_output_item_done, parse_responses_output, update_agent_output_text_event,
+    handle_responses_stream_message, handle_streamed_output_item_done, parse_responses_output,
+    update_agent_output_text_event,
 };
 use super::tool_calls::parse_read_file;
 use super::types::{
     ResponsesApiResponse, ResponsesContentItem, ResponsesFunctionCallArgumentsDoneEvent,
-    ResponsesOutputItem, StreamingResponsesAccumulator, StreamingTextMessageState,
+    ResponsesOutputItem, ResponsesReasoningSummaryPart, StreamingResponsesAccumulator,
+    StreamingTextMessageState,
 };
 use super::*;
+use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::agent::task::TaskId;
 use crate::ai::agent::AIAgentActionResult;
 use crate::ai::agent::AIAgentContext;
 use crate::ai::agent::AIAgentInput;
 use crate::ai::agent::MCPContext;
 use crate::ai::agent::MCPServer;
-use crate::ai::agent::conversation::AIConversationId;
-use crate::ai::agent::task::TaskId;
 use crate::ai::blocklist::SessionContext;
 use crate::ai::llms::{LLMId, LLMProvider};
 
@@ -125,8 +127,14 @@ fn normalize_openai_model_and_reasoning_extracts_effort() {
     assert_eq!(
         reasoning
             .as_ref()
-            .map(|reasoning| reasoning.effort.as_str()),
+            .and_then(|reasoning| reasoning.effort.as_deref()),
         Some("low")
+    );
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.summary.as_deref()),
+        Some("auto")
     );
 }
 
@@ -138,8 +146,14 @@ fn normalize_openai_model_and_reasoning_extracts_effort_for_gpt_5_5() {
     assert_eq!(
         reasoning
             .as_ref()
-            .map(|reasoning| reasoning.effort.as_str()),
+            .and_then(|reasoning| reasoning.effort.as_deref()),
         Some("low")
+    );
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.summary.as_deref()),
+        Some("auto")
     );
 }
 
@@ -151,8 +165,14 @@ fn normalize_openai_model_and_reasoning_extracts_effort_for_gpt_5_2() {
     assert_eq!(
         reasoning
             .as_ref()
-            .map(|reasoning| reasoning.effort.as_str()),
+            .and_then(|reasoning| reasoning.effort.as_deref()),
         Some("low")
+    );
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.summary.as_deref()),
+        Some("auto")
     );
 }
 
@@ -164,8 +184,14 @@ fn normalize_openai_model_and_reasoning_extracts_effort_for_gpt_5_2_codex() {
     assert_eq!(
         reasoning
             .as_ref()
-            .map(|reasoning| reasoning.effort.as_str()),
+            .and_then(|reasoning| reasoning.effort.as_deref()),
         Some("low")
+    );
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.summary.as_deref()),
+        Some("auto")
     );
 }
 
@@ -177,8 +203,14 @@ fn normalize_openai_model_and_reasoning_extracts_effort_for_gpt_5_3_codex() {
     assert_eq!(
         reasoning
             .as_ref()
-            .map(|reasoning| reasoning.effort.as_str()),
+            .and_then(|reasoning| reasoning.effort.as_deref()),
         Some("low")
+    );
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.summary.as_deref()),
+        Some("auto")
     );
 }
 
@@ -190,36 +222,80 @@ fn build_local_openai_system_prompt_injects_model_name() {
     assert!(!prompt.contains("__LOCAL_OPENAI_MODEL__"));
 }
 
-/// Verifies that base GPT numeric variants are normalized without inventing a reasoning effort.
+/// Verifies that base GPT numeric variants opt into reasoning summaries without inventing an effort.
 #[test]
 fn normalize_openai_model_and_reasoning_preserves_base_variant() {
     let (model, reasoning) = normalize_openai_model_and_reasoning("gpt-5-4");
     assert_eq!(model, "gpt-5.4");
-    assert!(reasoning.is_none());
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.as_deref()),
+        None
+    );
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.summary.as_deref()),
+        Some("auto")
+    );
 }
 
-/// Verifies that base GPT-5.5 variants are normalized without inventing a reasoning effort.
+/// Verifies that base GPT-5.5 variants opt into reasoning summaries without inventing an effort.
 #[test]
 fn normalize_openai_model_and_reasoning_preserves_gpt_5_5_base_variant() {
     let (model, reasoning) = normalize_openai_model_and_reasoning("gpt-5-5");
     assert_eq!(model, "gpt-5.5");
-    assert!(reasoning.is_none());
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.as_deref()),
+        None
+    );
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.summary.as_deref()),
+        Some("auto")
+    );
 }
 
-/// Verifies that base GPT-5.2 Codex variants are preserved without inventing a reasoning effort.
+/// Verifies that base GPT-5.2 Codex variants opt into reasoning summaries without inventing an effort.
 #[test]
 fn normalize_openai_model_and_reasoning_preserves_gpt_5_2_codex_base_variant() {
     let (model, reasoning) = normalize_openai_model_and_reasoning("gpt-5.2-codex");
     assert_eq!(model, "gpt-5.2-codex");
-    assert!(reasoning.is_none());
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.as_deref()),
+        None
+    );
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.summary.as_deref()),
+        Some("auto")
+    );
 }
 
-/// Verifies that base GPT-5.3 Codex variants are preserved without inventing a reasoning effort.
+/// Verifies that base GPT-5.3 Codex variants opt into reasoning summaries without inventing an effort.
 #[test]
 fn normalize_openai_model_and_reasoning_preserves_gpt_5_3_codex_base_variant() {
     let (model, reasoning) = normalize_openai_model_and_reasoning("gpt-5.3-codex");
     assert_eq!(model, "gpt-5.3-codex");
-    assert!(reasoning.is_none());
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.as_deref()),
+        None
+    );
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.summary.as_deref()),
+        Some("auto")
+    );
 }
 
 /// Verifies that MCP tool schemas reuse the server-provided description and JSON Schema.
@@ -330,6 +406,14 @@ fn prepare_local_responses_request_configures_parallel_tool_calls_and_store_poli
     assert_eq!(request_body["parallel_tool_calls"], serde_json::json!(true));
     assert_eq!(request_body["tool_choice"], serde_json::json!("auto"));
     assert_eq!(request_body["store"], serde_json::json!(false));
+    assert_eq!(
+        request_body["reasoning"]["effort"],
+        serde_json::json!("low")
+    );
+    assert_eq!(
+        request_body["reasoning"]["summary"],
+        serde_json::json!("auto")
+    );
 }
 
 /// Verifies that streaming text deltas update the existing agent output field.
@@ -373,6 +457,158 @@ fn update_agent_output_text_event_replaces_text() {
         panic!("expected agent output message");
     };
     assert_eq!(agent_output.text, "hello world");
+}
+
+/// Verifies that streamed reasoning deltas update the existing agent reasoning message and finalize its duration.
+#[test]
+fn streamed_reasoning_events_update_reasoning_text_and_duration() {
+    let params = request_params_for_local_backend_tests();
+    let task_id = TaskId::new("task-id".to_string());
+    let mut accumulator = StreamingResponsesAccumulator::default();
+
+    let delta_result = handle_responses_stream_message(
+        &params,
+        &task_id,
+        "request-id",
+        "response.reasoning_summary_text.delta",
+        r#"{"item_id":"rs_1","summary_index":0,"delta":"First pass"}"#,
+        &mut accumulator,
+    )
+    .expect("reasoning delta should parse");
+    assert_eq!(delta_result.events.len(), 1);
+
+    let delta_event = delta_result.events[0]
+        .as_ref()
+        .expect("delta event should be ok");
+    let Some(api::response_event::Type::ClientActions(delta_actions)) = &delta_event.r#type else {
+        panic!("expected client actions");
+    };
+    let Some(api::client_action::Action::AddMessagesToTask(delta_add)) =
+        delta_actions.actions[0].action.as_ref()
+    else {
+        panic!("expected add-messages action");
+    };
+    let initial_message = delta_add.messages[0].clone();
+    let Some(api::message::Message::AgentReasoning(initial_reasoning)) = &initial_message.message
+    else {
+        panic!("expected initial reasoning message");
+    };
+    assert_eq!(initial_reasoning.reasoning, "First pass");
+    assert!(initial_reasoning.finished_duration.is_none());
+
+    let done_result = handle_responses_stream_message(
+        &params,
+        &task_id,
+        "request-id",
+        "response.reasoning_summary_text.done",
+        r#"{"item_id":"rs_1","summary_index":0,"text":"First pass complete"}"#,
+        &mut accumulator,
+    )
+    .expect("reasoning done should parse");
+    assert_eq!(done_result.events.len(), 1);
+
+    let done_event = done_result.events[0]
+        .as_ref()
+        .expect("done event should be ok");
+    let Some(api::response_event::Type::ClientActions(done_actions)) = &done_event.r#type else {
+        panic!("expected client actions");
+    };
+    let Some(api::client_action::Action::UpdateTaskMessage(update)) =
+        done_actions.actions[0].action.as_ref()
+    else {
+        panic!("expected update action");
+    };
+    let merged = field_mask::FieldMaskOperation::update(
+        &api::MESSAGE_DESCRIPTOR,
+        &initial_message,
+        update
+            .message
+            .as_ref()
+            .expect("update message should exist"),
+        update.mask.clone().expect("update mask should exist"),
+    )
+    .apply()
+    .expect("reasoning update should succeed");
+
+    let Some(api::message::Message::AgentReasoning(reasoning)) = merged.message else {
+        panic!("expected reasoning message");
+    };
+    assert_eq!(reasoning.reasoning, "First pass complete");
+    assert!(reasoning.finished_duration.is_some());
+}
+
+/// Verifies that completed reasoning output items are backfilled into task messages.
+#[test]
+fn finalize_stream_state_backfills_reasoning_messages_from_completed_output() {
+    let params = request_params_for_local_backend_tests();
+    conversation_state_store()
+        .lock()
+        .insert(params.conversation_id, LocalConversationState::default());
+
+    let events = finalize_stream_state(
+        &params,
+        StreamingResponsesAccumulator::default(),
+        "request-id",
+        Some(ResponsesApiResponse {
+            output: vec![
+                ResponsesOutputItem {
+                    id: Some("rs_1".to_string()),
+                    item_type: "reasoning".to_string(),
+                    role: None,
+                    content: vec![],
+                    summary: vec![ResponsesReasoningSummaryPart {
+                        item_type: "summary_text".to_string(),
+                        text: Some("Checked the repository wiring first.".to_string()),
+                    }],
+                    name: None,
+                    call_id: None,
+                    arguments: None,
+                },
+                ResponsesOutputItem {
+                    id: Some("msg_1".to_string()),
+                    item_type: "message".to_string(),
+                    role: Some("assistant".to_string()),
+                    content: vec![ResponsesContentItem {
+                        item_type: "output_text".to_string(),
+                        text: Some("Done".to_string()),
+                    }],
+                    summary: vec![],
+                    name: None,
+                    call_id: None,
+                    arguments: None,
+                },
+            ],
+        }),
+    )
+    .expect("completed payload should finalize");
+
+    assert_eq!(events.len(), 2);
+    let add_messages_event = events[0].as_ref().expect("add-messages event should be ok");
+    let Some(api::response_event::Type::ClientActions(actions)) = &add_messages_event.r#type else {
+        panic!("expected client actions");
+    };
+    let Some(api::client_action::Action::AddMessagesToTask(add_messages)) =
+        actions.actions[0].action.as_ref()
+    else {
+        panic!("expected add-messages action");
+    };
+    let reasoning_message = add_messages
+        .messages
+        .iter()
+        .find_map(|message| match &message.message {
+            Some(api::message::Message::AgentReasoning(reasoning)) => Some(reasoning),
+            _ => None,
+        })
+        .expect("expected a backfilled reasoning message");
+    assert_eq!(
+        reasoning_message.reasoning,
+        "Checked the repository wiring first."
+    );
+    assert!(reasoning_message.finished_duration.is_some());
+
+    conversation_state_store()
+        .lock()
+        .remove(&params.conversation_id);
 }
 
 /// Verifies that an empty completed payload does not fail if text was already streamed.
@@ -445,6 +681,7 @@ fn streamed_function_calls_use_output_item_done_to_get_real_call_id() {
             item_type: "function_call".to_string(),
             role: None,
             content: vec![],
+            summary: vec![],
             name: Some("file_glob".to_string()),
             call_id: Some("call_real_123".to_string()),
             arguments: Some(r#"{"path":"."}"#.to_string()),
@@ -488,6 +725,7 @@ fn streamed_function_calls_wait_for_output_item_name() {
             item_type: "function_call".to_string(),
             role: None,
             content: vec![],
+            summary: vec![],
             name: Some("file_glob".to_string()),
             call_id: Some("call_real_456".to_string()),
             arguments: Some(r#"{"path":"."}"#.to_string()),
@@ -519,6 +757,7 @@ fn streamed_function_calls_fall_back_to_item_id_when_output_item_has_no_call_id(
             item_type: "function_call".to_string(),
             role: None,
             content: vec![],
+            summary: vec![],
             name: Some("file_glob".to_string()),
             call_id: None,
             arguments: Some(r#"{"path":"."}"#.to_string()),
@@ -768,6 +1007,7 @@ fn parse_responses_output_extracts_text_and_function_calls() {
                 item_type: "output_text".to_string(),
                 text: Some("done".to_string()),
             }],
+            summary: vec![],
             name: None,
             call_id: None,
             arguments: None,
@@ -777,6 +1017,7 @@ fn parse_responses_output_extracts_text_and_function_calls() {
             item_type: "function_call".to_string(),
             role: None,
             content: vec![],
+            summary: vec![],
             name: Some("read_files".to_string()),
             call_id: Some("call_1".to_string()),
             arguments: Some(r#"{"files":[{"name":"README.md"}]}"#.to_string()),

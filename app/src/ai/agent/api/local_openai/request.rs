@@ -3,9 +3,9 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::anyhow;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use prost::Message as _;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use uuid::Uuid;
 use warp_multi_agent_api as api;
 
@@ -18,7 +18,7 @@ use super::types::{
     ParsedFunctionCall, ResponsesErrorEnvelope, ResponsesReasoningConfig, ResponsesRequestBody,
 };
 use super::{
-    ProviderError, RequestParams, build_local_openai_system_prompt, conversation_state_store,
+    build_local_openai_system_prompt, conversation_state_store, ProviderError, RequestParams,
 };
 use crate::ai::agent::api::r#impl::get_supported_tools;
 
@@ -536,6 +536,9 @@ pub(super) fn normalize_openai_model_and_reasoning(
 ) -> (String, Option<ResponsesReasoningConfig>) {
     let (base_model_id, reasoning) = split_openai_reasoning_suffix(model_id);
     if let Some(normalized_model) = normalize_openai_model_base(base_model_id) {
+        let reasoning = reasoning
+            .map(enable_reasoning_summary)
+            .or_else(|| build_reasoning_summary_config(&normalized_model));
         return (normalized_model, reasoning);
     }
 
@@ -551,12 +554,34 @@ fn split_openai_reasoning_suffix(model_id: &str) -> (&str, Option<ResponsesReaso
         return (
             base_model_id,
             Some(ResponsesReasoningConfig {
-                effort: effort.to_string(),
+                effort: Some(effort.to_string()),
+                summary: None,
             }),
         );
     }
 
     (model_id, None)
+}
+
+/// Enables reasoning summaries on a Responses reasoning config so Warp can render thinking blocks.
+fn enable_reasoning_summary(mut reasoning: ResponsesReasoningConfig) -> ResponsesReasoningConfig {
+    reasoning.summary = Some("auto".to_string());
+    reasoning
+}
+
+/// Builds a summary-only reasoning config for supported OpenAI reasoning models.
+fn build_reasoning_summary_config(model_id: &str) -> Option<ResponsesReasoningConfig> {
+    should_request_reasoning_summary(model_id).then(|| ResponsesReasoningConfig {
+        effort: None,
+        summary: Some("auto".to_string()),
+    })
+}
+
+/// Returns whether Warp should opt into reasoning summaries for the given normalized model.
+fn should_request_reasoning_summary(model_id: &str) -> bool {
+    model_id.starts_with("gpt-5")
+        || model_id.starts_with("gpt-oss")
+        || matches!(model_id.split('-').next(), Some("o1" | "o3" | "o4"))
 }
 
 /// Normalizes the base model ID into the exact Responses API model name when we recognize it.

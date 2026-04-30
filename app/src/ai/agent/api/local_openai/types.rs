@@ -1,6 +1,7 @@
 //! Shared data types for the local OpenAI-compatible Responses backend.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -32,6 +33,8 @@ pub(super) struct ResponsesOutputItem {
     #[serde(default)]
     pub(super) content: Vec<ResponsesContentItem>,
     #[serde(default)]
+    pub(super) summary: Vec<ResponsesReasoningSummaryPart>,
+    #[serde(default)]
     pub(super) name: Option<String>,
     #[serde(default)]
     pub(super) call_id: Option<String>,
@@ -42,6 +45,15 @@ pub(super) struct ResponsesOutputItem {
 /// Parsed subset of a message content item returned by Responses.
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct ResponsesContentItem {
+    #[serde(rename = "type")]
+    pub(super) item_type: String,
+    #[serde(default)]
+    pub(super) text: Option<String>,
+}
+
+/// Parsed subset of a reasoning summary part returned by Responses.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ResponsesReasoningSummaryPart {
     #[serde(rename = "type")]
     pub(super) item_type: String,
     #[serde(default)]
@@ -87,7 +99,10 @@ pub(super) struct ResponsesRequestBody {
 /// Reasoning configuration supported by the Responses API.
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct ResponsesReasoningConfig {
-    pub(super) effort: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) summary: Option<String>,
 }
 
 /// Tracks streamed assistant text for a single Responses output item.
@@ -95,6 +110,14 @@ pub(super) struct ResponsesReasoningConfig {
 pub(super) struct StreamingTextMessageState {
     pub(super) message_id: String,
     pub(super) text: String,
+}
+
+/// Tracks streamed reasoning text for a single Responses reasoning item.
+#[derive(Debug, Clone)]
+pub(super) struct StreamingReasoningMessageState {
+    pub(super) message_id: String,
+    pub(super) text: String,
+    pub(super) started_at: Instant,
 }
 
 /// Tracks streamed function call arguments for a single Responses tool call.
@@ -108,12 +131,29 @@ pub(super) struct StreamingFunctionCallState {
 }
 
 /// Aggregates streaming state until the Responses stream completes.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct StreamingResponsesAccumulator {
+    pub(super) stream_started_at: Instant,
     pub(super) text_messages_by_item_id: HashMap<String, StreamingTextMessageState>,
     pub(super) emitted_text_item_ids: Vec<String>,
+    pub(super) reasoning_messages_by_key: HashMap<String, StreamingReasoningMessageState>,
+    pub(super) emitted_reasoning_keys: Vec<String>,
     pub(super) function_calls_by_call_id: HashMap<String, StreamingFunctionCallState>,
     pub(super) emitted_function_call_ids: Vec<String>,
+}
+
+impl Default for StreamingResponsesAccumulator {
+    fn default() -> Self {
+        Self {
+            stream_started_at: Instant::now(),
+            text_messages_by_item_id: HashMap::new(),
+            emitted_text_item_ids: Vec::new(),
+            reasoning_messages_by_key: HashMap::new(),
+            emitted_reasoning_keys: Vec::new(),
+            function_calls_by_call_id: HashMap::new(),
+            emitted_function_call_ids: Vec::new(),
+        }
+    }
 }
 
 /// Minimal typed view over a streamed text delta event.
@@ -121,6 +161,42 @@ pub(super) struct StreamingResponsesAccumulator {
 pub(super) struct ResponsesTextDeltaEvent {
     pub(super) item_id: String,
     pub(super) delta: String,
+}
+
+/// Minimal typed view over a streamed reasoning text delta event.
+#[derive(Debug, Deserialize)]
+pub(super) struct ResponsesReasoningTextDeltaEvent {
+    pub(super) item_id: String,
+    #[serde(default)]
+    pub(super) summary_index: Option<usize>,
+    #[serde(default)]
+    pub(super) content_index: Option<usize>,
+    pub(super) delta: String,
+}
+
+/// Minimal typed view over a streamed reasoning text completion event.
+#[derive(Debug, Deserialize)]
+pub(super) struct ResponsesReasoningTextDoneEvent {
+    pub(super) item_id: String,
+    #[serde(default)]
+    pub(super) summary_index: Option<usize>,
+    #[serde(default)]
+    pub(super) content_index: Option<usize>,
+    #[serde(default)]
+    pub(super) text: String,
+    #[serde(default)]
+    pub(super) part: Option<ResponsesContentItem>,
+}
+
+/// Minimal typed view over a streamed reasoning-part creation event.
+#[derive(Debug, Deserialize)]
+pub(super) struct ResponsesReasoningPartAddedEvent {
+    pub(super) item_id: String,
+    #[serde(default)]
+    pub(super) summary_index: Option<usize>,
+    #[serde(default)]
+    pub(super) content_index: Option<usize>,
+    pub(super) part: ResponsesContentItem,
 }
 
 /// Minimal typed view over a streamed function call arguments delta event.

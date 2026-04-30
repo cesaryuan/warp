@@ -1,5 +1,7 @@
 //! Streaming response handling for the local OpenAI-compatible Responses backend.
 
+use std::time::Duration;
+
 use anyhow::{anyhow, Context as _};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -12,9 +14,10 @@ use super::tool_calls::parse_tool_call;
 use super::types::{
     ParsedFunctionCall, ResponsesApiResponse, ResponsesCompletedEvent,
     ResponsesFunctionCallArgumentsDeltaEvent, ResponsesFunctionCallArgumentsDoneEvent,
-    ResponsesOutputItem, ResponsesOutputItemDoneEvent, ResponsesTextDeltaEvent,
-    StreamMessageResult, StreamingFunctionCallState, StreamingResponsesAccumulator,
-    StreamingTextMessageState,
+    ResponsesOutputItem, ResponsesOutputItemDoneEvent, ResponsesReasoningPartAddedEvent,
+    ResponsesReasoningTextDeltaEvent, ResponsesReasoningTextDoneEvent, ResponsesTextDeltaEvent,
+    StreamMessageResult, StreamingFunctionCallState, StreamingReasoningMessageState,
+    StreamingResponsesAccumulator, StreamingTextMessageState,
 };
 use super::{
     add_messages_event, conversation_state_store, finished_reason_for_error, stream_finished_event,
@@ -101,6 +104,47 @@ pub(super) fn handle_responses_stream_message(
                 is_terminal: false,
             })
         }
+        "response.reasoning_summary_part.added" | "response.reasoning_text_part.added" => {
+            let added_event: ResponsesReasoningPartAddedEvent = serde_json::from_value(payload)?;
+            handle_streamed_reasoning_part_added(event_type.as_str(), accumulator, added_event)?;
+            Ok(StreamMessageResult::default())
+        }
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            let delta_event: ResponsesReasoningTextDeltaEvent = serde_json::from_value(payload)?;
+            let Some(event) = handle_streamed_reasoning_delta(
+                task_id,
+                request_id,
+                accumulator,
+                event_type.as_str(),
+                delta_event,
+            )?
+            else {
+                return Ok(StreamMessageResult::default());
+            };
+
+            Ok(StreamMessageResult {
+                events: vec![Ok(event)],
+                is_terminal: false,
+            })
+        }
+        "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
+            let done_event: ResponsesReasoningTextDoneEvent = serde_json::from_value(payload)?;
+            let Some(event) = handle_streamed_reasoning_done(
+                task_id,
+                request_id,
+                accumulator,
+                event_type.as_str(),
+                done_event,
+            )?
+            else {
+                return Ok(StreamMessageResult::default());
+            };
+
+            Ok(StreamMessageResult {
+                events: vec![Ok(event)],
+                is_terminal: false,
+            })
+        }
         "response.function_call_arguments.delta" => {
             let delta_event: ResponsesFunctionCallArgumentsDeltaEvent =
                 serde_json::from_value(payload)?;
@@ -133,6 +177,33 @@ pub(super) fn handle_responses_stream_message(
         }
         "response.output_item.done" => {
             let done_event: ResponsesOutputItemDoneEvent = serde_json::from_value(payload)?;
+            if done_event.item.item_type == "reasoning" {
+                let reasoning_messages = reasoning_messages_from_output_item(
+                    task_id,
+                    request_id,
+                    accumulator,
+                    &done_event.item,
+                );
+                if reasoning_messages.is_empty() {
+                    return Ok(StreamMessageResult::default());
+                }
+                for reasoning_text in reasoning_output_texts(&done_event.item) {
+                    if let Some(reasoning_key) = backfill_reasoning_key(
+                        done_event.item.id.as_deref(),
+                        reasoning_text.key_kind,
+                        reasoning_text.index,
+                    ) {
+                        if !reasoning_key_already_emitted(accumulator, reasoning_key.as_str()) {
+                            accumulator.emitted_reasoning_keys.push(reasoning_key);
+                        }
+                    }
+                }
+
+                return Ok(StreamMessageResult {
+                    events: vec![Ok(add_messages_event(task_id, reasoning_messages))],
+                    is_terminal: false,
+                });
+            }
             let Some(function_call) =
                 handle_streamed_output_item_done(accumulator, done_event.item)?
             else {
@@ -224,6 +295,130 @@ fn handle_streamed_text_delta(
             task_id,
             request_id,
             delta_event.delta,
+        )],
+    )))
+}
+
+/// Seeds reasoning stream state when the provider announces a new reasoning part.
+fn handle_streamed_reasoning_part_added(
+    event_type: &str,
+    accumulator: &mut StreamingResponsesAccumulator,
+    added_event: ResponsesReasoningPartAddedEvent,
+) -> anyhow::Result<()> {
+    if !reasoning_part_type_matches_event(event_type, added_event.part.item_type.as_str()) {
+        return Ok(());
+    }
+
+    let reasoning_key = streamed_reasoning_key(
+        event_type,
+        added_event.item_id.as_str(),
+        added_event.summary_index,
+        added_event.content_index,
+    )?;
+    accumulator
+        .reasoning_messages_by_key
+        .entry(reasoning_key)
+        .or_insert_with(new_streaming_reasoning_message_state);
+    Ok(())
+}
+
+/// Creates or appends to a streamed reasoning message based on a Responses reasoning delta.
+fn handle_streamed_reasoning_delta(
+    task_id: &TaskId,
+    request_id: &str,
+    accumulator: &mut StreamingResponsesAccumulator,
+    event_type: &str,
+    delta_event: ResponsesReasoningTextDeltaEvent,
+) -> anyhow::Result<Option<api::ResponseEvent>> {
+    if delta_event.delta.is_empty() {
+        return Ok(None);
+    }
+
+    let reasoning_key = streamed_reasoning_key(
+        event_type,
+        delta_event.item_id.as_str(),
+        delta_event.summary_index,
+        delta_event.content_index,
+    )?;
+    let (message_id, full_text) = {
+        let state = accumulator
+            .reasoning_messages_by_key
+            .entry(reasoning_key.clone())
+            .or_insert_with(new_streaming_reasoning_message_state);
+        state.text.push_str(&delta_event.delta);
+        (state.message_id.clone(), state.text.clone())
+    };
+
+    if reasoning_key_already_emitted(accumulator, reasoning_key.as_str()) {
+        return Ok(Some(update_agent_reasoning_event(
+            task_id,
+            request_id,
+            &message_id,
+            full_text,
+            None,
+        )));
+    }
+
+    accumulator.emitted_reasoning_keys.push(reasoning_key);
+    Ok(Some(add_messages_event(
+        task_id,
+        vec![reasoning_message_with_id(
+            message_id, task_id, request_id, full_text, None,
+        )],
+    )))
+}
+
+/// Finalizes a streamed reasoning message once the provider marks the text complete.
+fn handle_streamed_reasoning_done(
+    task_id: &TaskId,
+    request_id: &str,
+    accumulator: &mut StreamingResponsesAccumulator,
+    event_type: &str,
+    done_event: ResponsesReasoningTextDoneEvent,
+) -> anyhow::Result<Option<api::ResponseEvent>> {
+    let reasoning_key = streamed_reasoning_key(
+        event_type,
+        done_event.item_id.as_str(),
+        done_event.summary_index,
+        done_event.content_index,
+    )?;
+    let resolved_text = completed_reasoning_text(&done_event);
+    let (message_id, final_text, finished_duration) = {
+        let state = accumulator
+            .reasoning_messages_by_key
+            .entry(reasoning_key.clone())
+            .or_insert_with(new_streaming_reasoning_message_state);
+        let final_text = resolved_text.unwrap_or_else(|| state.text.clone());
+        if final_text.is_empty() {
+            return Ok(None);
+        }
+        state.text = final_text.clone();
+        (
+            state.message_id.clone(),
+            final_text,
+            Some(state.started_at.elapsed()),
+        )
+    };
+
+    if reasoning_key_already_emitted(accumulator, reasoning_key.as_str()) {
+        return Ok(Some(update_agent_reasoning_event(
+            task_id,
+            request_id,
+            &message_id,
+            final_text,
+            finished_duration,
+        )));
+    }
+
+    accumulator.emitted_reasoning_keys.push(reasoning_key);
+    Ok(Some(add_messages_event(
+        task_id,
+        vec![reasoning_message_with_id(
+            message_id,
+            task_id,
+            request_id,
+            final_text,
+            finished_duration,
         )],
     )))
 }
@@ -468,6 +663,7 @@ pub(super) fn finalize_stream_state(
 /// Returns whether the accumulator already captured streamed text or tool calls.
 fn has_streamed_output(accumulator: &StreamingResponsesAccumulator) -> bool {
     !accumulator.text_messages_by_item_id.is_empty()
+        || !accumulator.emitted_reasoning_keys.is_empty()
         || !accumulator.emitted_function_call_ids.is_empty()
 }
 
@@ -545,6 +741,14 @@ fn build_backfill_messages(
                     messages.push(agent_output_message(task_id, request_id, text));
                 }
             }
+            "reasoning" => {
+                messages.extend(reasoning_messages_from_output_item(
+                    task_id,
+                    request_id,
+                    accumulator,
+                    &item,
+                ));
+            }
             "function_call" => {
                 let Some(call_id) = item.call_id.as_ref() else {
                     continue;
@@ -577,6 +781,159 @@ fn build_backfill_messages(
     }
 
     Ok(messages)
+}
+
+/// Builds reasoning messages from a completed reasoning output item that was not streamed incrementally.
+fn reasoning_messages_from_output_item(
+    task_id: &TaskId,
+    request_id: &str,
+    accumulator: &StreamingResponsesAccumulator,
+    item: &ResponsesOutputItem,
+) -> Vec<api::Message> {
+    let fallback_duration = Some(accumulator.stream_started_at.elapsed());
+    reasoning_output_texts(item)
+        .into_iter()
+        .filter_map(|reasoning_text| {
+            let reasoning_key = backfill_reasoning_key(
+                item.id.as_deref(),
+                reasoning_text.key_kind,
+                reasoning_text.index,
+            );
+            if reasoning_key
+                .as_deref()
+                .is_some_and(|key| reasoning_key_already_emitted(accumulator, key))
+            {
+                return None;
+            }
+
+            Some(reasoning_message_with_id(
+                Uuid::new_v4().to_string(),
+                task_id,
+                request_id,
+                reasoning_text.text,
+                fallback_duration,
+            ))
+        })
+        .collect()
+}
+
+/// Extracts the reasoning texts Warp should render from a Responses reasoning output item.
+fn reasoning_output_texts(item: &ResponsesOutputItem) -> Vec<ReasoningOutputText> {
+    let summary_texts = item
+        .summary
+        .iter()
+        .enumerate()
+        .filter_map(|(index, part)| {
+            normalize_reasoning_output_text(part.item_type.as_str(), part.text.as_deref()).map(
+                |text| ReasoningOutputText {
+                    key_kind: "summary",
+                    index,
+                    text,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    if !summary_texts.is_empty() {
+        return summary_texts;
+    }
+
+    item.content
+        .iter()
+        .enumerate()
+        .filter_map(|(index, part)| {
+            normalize_reasoning_output_text(part.item_type.as_str(), part.text.as_deref()).map(
+                |text| ReasoningOutputText {
+                    key_kind: "content",
+                    index,
+                    text,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Normalizes a reasoning text fragment if the Responses content part is one Warp can display.
+fn normalize_reasoning_output_text(part_type: &str, text: Option<&str>) -> Option<String> {
+    matches!(part_type, "summary_text" | "reasoning_text")
+        .then(|| text.unwrap_or_default().trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+/// Returns the stable key used to dedupe backfilled reasoning messages against streamed ones.
+fn backfill_reasoning_key(item_id: Option<&str>, key_kind: &str, index: usize) -> Option<String> {
+    item_id.map(|item_id| format!("reasoning:{key_kind}:{item_id}:{index}"))
+}
+
+/// Returns whether a reasoning part type matches the corresponding streamed event family.
+fn reasoning_part_type_matches_event(event_type: &str, part_type: &str) -> bool {
+    match event_type {
+        "response.reasoning_summary_part.added" => part_type == "summary_text",
+        "response.reasoning_text_part.added" => part_type == "reasoning_text",
+        _ => false,
+    }
+}
+
+/// Returns the completed reasoning text from a `*.done` event if the payload carries one explicitly.
+fn completed_reasoning_text(done_event: &ResponsesReasoningTextDoneEvent) -> Option<String> {
+    if !done_event.text.trim().is_empty() {
+        return Some(done_event.text.trim().to_string());
+    }
+
+    done_event.part.as_ref().and_then(|part| {
+        normalize_reasoning_output_text(part.item_type.as_str(), part.text.as_deref())
+    })
+}
+
+/// Builds the stable accumulator key for a streamed reasoning fragment.
+fn streamed_reasoning_key(
+    event_type: &str,
+    item_id: &str,
+    summary_index: Option<usize>,
+    content_index: Option<usize>,
+) -> anyhow::Result<String> {
+    if item_id.is_empty() {
+        return Err(anyhow!(
+            "Streaming reasoning event did not include an item_id"
+        ));
+    }
+
+    match event_type {
+        "response.reasoning_summary_part.added"
+        | "response.reasoning_summary_text.delta"
+        | "response.reasoning_summary_text.done" => Ok(format!(
+            "reasoning:summary:{item_id}:{}",
+            summary_index.unwrap_or(0)
+        )),
+        "response.reasoning_text_part.added"
+        | "response.reasoning_text.delta"
+        | "response.reasoning_text.done" => Ok(format!(
+            "reasoning:content:{item_id}:{}",
+            content_index.unwrap_or(0)
+        )),
+        _ => Err(anyhow!(
+            "Unsupported reasoning stream event type: {event_type}"
+        )),
+    }
+}
+
+/// Returns whether the given reasoning key has already produced a client-visible message.
+fn reasoning_key_already_emitted(
+    accumulator: &StreamingResponsesAccumulator,
+    reasoning_key: &str,
+) -> bool {
+    accumulator
+        .emitted_reasoning_keys
+        .iter()
+        .any(|existing_key| existing_key == reasoning_key)
+}
+
+/// Creates a new streamed reasoning state with a stable message ID and start timestamp.
+fn new_streaming_reasoning_message_state() -> StreamingReasoningMessageState {
+    StreamingReasoningMessageState {
+        message_id: Uuid::new_v4().to_string(),
+        text: String::new(),
+        started_at: std::time::Instant::now(),
+    }
 }
 
 /// Resolves the canonical event type for a streamed SSE message.
@@ -657,6 +1014,30 @@ fn agent_output_message(task_id: &TaskId, request_id: &str, text: String) -> api
     agent_output_message_with_id(Uuid::new_v4().to_string(), task_id, request_id, text)
 }
 
+/// Converts reasoning text into a Warp agent reasoning message with a stable message ID.
+fn reasoning_message_with_id(
+    message_id: String,
+    task_id: &TaskId,
+    request_id: &str,
+    text: String,
+    finished_duration: Option<Duration>,
+) -> api::Message {
+    api::Message {
+        id: message_id,
+        task_id: task_id.to_string(),
+        server_message_data: String::new(),
+        citations: vec![],
+        message: Some(api::message::Message::AgentReasoning(
+            api::message::AgentReasoning {
+                reasoning: text,
+                finished_duration: finished_duration.map(duration_to_proto),
+            },
+        )),
+        request_id: request_id.to_string(),
+        timestamp: None,
+    }
+}
+
 /// Converts assistant text into a Warp agent output message with a stable message ID.
 pub(super) fn agent_output_message_with_id(
     message_id: String,
@@ -706,4 +1087,55 @@ pub(super) fn update_agent_output_text_event(
             },
         )),
     }
+}
+
+/// Builds an update client action for a streamed reasoning message, optionally finalizing its duration.
+fn update_agent_reasoning_event(
+    task_id: &TaskId,
+    request_id: &str,
+    message_id: &str,
+    full_text: String,
+    finished_duration: Option<Duration>,
+) -> api::ResponseEvent {
+    let mut mask_paths = vec!["agent_reasoning.reasoning".to_string()];
+    if finished_duration.is_some() {
+        mask_paths.push("agent_reasoning.finished_duration".to_string());
+    }
+
+    api::ResponseEvent {
+        r#type: Some(api::response_event::Type::ClientActions(
+            api::response_event::ClientActions {
+                actions: vec![api::ClientAction {
+                    action: Some(api::client_action::Action::UpdateTaskMessage(
+                        api::client_action::UpdateTaskMessage {
+                            task_id: task_id.to_string(),
+                            message: Some(reasoning_message_with_id(
+                                message_id.to_string(),
+                                task_id,
+                                request_id,
+                                full_text,
+                                finished_duration,
+                            )),
+                            mask: Some(prost_types::FieldMask { paths: mask_paths }),
+                        },
+                    )),
+                }],
+            },
+        )),
+    }
+}
+
+/// Converts a std Duration into the protobuf Duration used by task message updates.
+fn duration_to_proto(duration: Duration) -> prost_types::Duration {
+    prost_types::Duration {
+        seconds: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+        nanos: i32::try_from(duration.subsec_nanos()).unwrap_or(i32::MAX),
+    }
+}
+
+/// Describes one reasoning text fragment extracted from a Responses reasoning output item.
+struct ReasoningOutputText {
+    key_kind: &'static str,
+    index: usize,
+    text: String,
 }

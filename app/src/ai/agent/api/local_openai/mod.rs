@@ -579,6 +579,10 @@ fn response_events_include_provider_output(
         event_name,
         "response.output_text.delta"
             | "response.text.delta"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary_text.done"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_text.done"
             | "response.function_call_arguments.done"
             | "response.output_item.done"
     ) {
