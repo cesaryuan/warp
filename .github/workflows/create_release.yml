@@ -95,6 +95,10 @@ on:
         description: Runner label for Windows release jobs.
         type: string
         default: windows-latest-large
+      bundle_features:
+        description: Optional additional Cargo features to pass to app bundle builds.
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       channel:
@@ -176,6 +180,10 @@ on:
         description: Runner label for Windows release jobs.
         type: string
         default: windows-latest-large
+      bundle_features:
+        description: Optional additional Cargo features to pass to app bundle builds.
+        type: string
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -314,6 +322,9 @@ jobs:
         id: bundle_app
         run: |
           BUNDLE_ARGS=(--channel "$CHANNEL" --arch "${{ matrix.arch }}" --dmg-name-suffix "${{ matrix.dmg_name_suffix }}")
+          if [[ -n "${{ inputs.bundle_features }}" ]]; then
+            BUNDLE_ARGS=(--features "${{ inputs.bundle_features }}" "${BUNDLE_ARGS[@]}")
+          fi
           if [[ "${{ inputs.sign_macos }}" == "true" ]]; then
             BUNDLE_ARGS=(--read-passwords-from-env "${BUNDLE_ARGS[@]}")
           else
@@ -454,6 +465,9 @@ jobs:
         id: bundle_app
         run: |
           BUNDLE_ARGS=(--skip-build --channel "$CHANNEL")
+          if [[ -n "${{ inputs.bundle_features }}" ]]; then
+            BUNDLE_ARGS=(--features "${{ inputs.bundle_features }}" "${BUNDLE_ARGS[@]}")
+          fi
           if [[ "${{ inputs.sign_macos }}" == "true" ]]; then
             BUNDLE_ARGS=(--read-passwords-from-env "${BUNDLE_ARGS[@]}")
           else
@@ -743,7 +757,11 @@ jobs:
         run: |
           # Build everything but the arch package, as we need to build it
           # within a Docker container.
-          script/bundle --channel $CHANNEL --packages appimage,deb,rpm
+          BUNDLE_ARGS=(--channel "$CHANNEL" --packages appimage,deb,rpm)
+          if [[ -n "${{ inputs.bundle_features }}" ]]; then
+            BUNDLE_ARGS=(--features "${{ inputs.bundle_features }}" "${BUNDLE_ARGS[@]}")
+          fi
+          script/bundle "${BUNDLE_ARGS[@]}"
         shell: bash
         env:
           CHANNEL: ${{ steps.get-config.outputs.channel }}
@@ -1053,7 +1071,11 @@ jobs:
         id: build_app
         run: |
           # Build the code, but only bundle the appimage
-          script/bundle --channel $CHANNEL --packages appimage
+          BUNDLE_ARGS=(--channel "$CHANNEL" --packages appimage)
+          if [[ -n "${{ inputs.bundle_features }}" ]]; then
+            BUNDLE_ARGS=(--features "${{ inputs.bundle_features }}" "${BUNDLE_ARGS[@]}")
+          fi
+          script/bundle "${BUNDLE_ARGS[@]}"
         shell: bash
         env:
           CHANNEL: ${{ steps.get-config.outputs.channel }}
@@ -1272,7 +1294,11 @@ jobs:
         run: |
           # Bundle everything but the arch package, as we need to bundle it
           # within a Docker container.
-          script/bundle --channel $CHANNEL --skip-build --packages deb,rpm --arch aarch64
+          BUNDLE_ARGS=(--channel "$CHANNEL" --skip-build --packages deb,rpm --arch aarch64)
+          if [[ -n "${{ inputs.bundle_features }}" ]]; then
+            BUNDLE_ARGS=(--features "${{ inputs.bundle_features }}" "${BUNDLE_ARGS[@]}")
+          fi
+          script/bundle "${BUNDLE_ARGS[@]}"
         shell: bash
         env:
           CHANNEL: ${{ steps.get-config.outputs.channel }}
@@ -1571,7 +1597,12 @@ jobs:
 
       - name: Build binary
         id: build_binary
-        run: script/bundle -Channel $CHANNEL -skip_build_installer --arch ${{ matrix.arch }}
+        run: |
+          BUNDLE_ARGS=(-Channel "$CHANNEL" -skip_build_installer --arch "${{ matrix.arch }}")
+          if [[ -n "${{ inputs.bundle_features }}" ]]; then
+            BUNDLE_ARGS+=(-features "${{ inputs.bundle_features }}")
+          fi
+          script/bundle "${BUNDLE_ARGS[@]}"
         shell: bash
         env:
           CHANNEL: ${{ steps.get-config.outputs.channel }}
@@ -1626,7 +1657,12 @@ jobs:
 
       - name: Bundle app
         id: bundle_app
-        run: script/bundle -Channel $CHANNEL -skip_build_binary --arch ${{ matrix.arch }}
+        run: |
+          BUNDLE_ARGS=(-Channel "$CHANNEL" -skip_build_binary --arch "${{ matrix.arch }}")
+          if [[ -n "${{ inputs.bundle_features }}" ]]; then
+            BUNDLE_ARGS+=(-features "${{ inputs.bundle_features }}")
+          fi
+          script/bundle "${BUNDLE_ARGS[@]}"
         shell: bash
         env:
           CHANNEL: ${{ steps.get-config.outputs.channel }}
