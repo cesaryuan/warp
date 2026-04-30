@@ -71,6 +71,7 @@ pub(super) fn prepare_local_responses_request(
             tools: build_tools_payload(params),
             tool_choice: "auto",
             parallel_tool_calls: true,
+            store: false,
             stream: true,
         }
     };

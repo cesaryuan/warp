@@ -315,9 +315,9 @@ fn run_shell_command_schema_includes_proto_risk_fields() {
     assert!(run_shell_schema["parameters"]["properties"]["risk_category"].is_object());
 }
 
-/// Verifies that local Responses requests explicitly opt into provider-side parallel tool calls.
+/// Verifies that local Responses requests opt into parallel tool calls without storing provider-side state.
 #[test]
-fn prepare_local_responses_request_enables_parallel_tool_calls() {
+fn prepare_local_responses_request_configures_parallel_tool_calls_and_store_policy() {
     let mut params = request_params_for_local_backend_tests();
     params.local_openai_api_key = Some("test-key".to_string());
     params.local_openai_base_url = Some("https://example.com".to_string());
@@ -329,6 +329,7 @@ fn prepare_local_responses_request_enables_parallel_tool_calls() {
 
     assert_eq!(request_body["parallel_tool_calls"], serde_json::json!(true));
     assert_eq!(request_body["tool_choice"], serde_json::json!("auto"));
+    assert_eq!(request_body["store"], serde_json::json!(false));
 }
 
 /// Verifies that streaming text deltas update the existing agent output field.

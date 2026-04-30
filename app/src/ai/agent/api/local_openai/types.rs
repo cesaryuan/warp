@@ -80,6 +80,7 @@ pub(super) struct ResponsesRequestBody {
     pub(super) tools: Vec<Value>,
     pub(super) tool_choice: &'static str,
     pub(super) parallel_tool_calls: bool,
+    pub(super) store: bool,
     pub(super) stream: bool,
 }
 
