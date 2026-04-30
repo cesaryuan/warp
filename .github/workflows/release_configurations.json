@@ -28,6 +28,19 @@
             "web_gcs_bucket_prefix": "warp"
         },
         {
+            "channel": "oss",
+            "type": "weekly",
+            "is_prerelease": false,
+            "is_autopush": false,
+            "release_base_name": "OSS Release",
+            "release_body_text": "Warp OSS release",
+            "sentry_project": "warp-client-beta-stable",
+            "sentry_environment": "oss_release",
+            "changelog_slack_channel": "#release",
+            "gcs_cache_control_value": "public, max-age=604800, immutable",
+            "web_gcs_bucket_prefix": "warp"
+        },
+        {
             "channel": "stable",
             "type": "weekly",
             "is_prerelease": false,

@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use async_trait::async_trait;
 use itertools::Itertools as _;
-use natural_language_detection::natural_language_words_score;
+use natural_language_detection::{check_if_token_has_shell_syntax, natural_language_words_score};
 use warp_completer::ParsedTokensSnapshot;
 
 use crate::{
@@ -49,6 +49,15 @@ impl InputClassifier for HeuristicClassifier {
             return InputType::AI;
         }
 
+        // Chinese and other non-Latin prompts are commonly entered without spaces, so
+        // the English-only heuristic below would otherwise collapse them into Shell mode.
+        if is_single_non_ascii_natural_language_token(&word_tokens, &input) {
+            log::debug!(
+                "Treating single non-ASCII token as AI input to avoid shell autodetection."
+            );
+            return InputType::AI;
+        }
+
         if is_likely_shell_command(&input, total_word_token_count).await {
             return InputType::Shell;
         }
@@ -89,6 +98,22 @@ impl InputClassifier for HeuristicClassifier {
         )
         .await)
     }
+}
+
+/// Returns true when a single token looks like a non-ASCII natural-language prompt.
+fn is_single_non_ascii_natural_language_token(
+    word_tokens: &[String],
+    input: &ParsedTokensSnapshot,
+) -> bool {
+    if word_tokens.len() != 1 {
+        return false;
+    }
+
+    let token = &word_tokens[0];
+
+    !is_installed_binary(input)
+        && !check_if_token_has_shell_syntax(token)
+        && token.chars().any(|ch| !ch.is_ascii() && ch.is_alphabetic())
 }
 
 /// Given some input text and current input type, return what type of input we think it is

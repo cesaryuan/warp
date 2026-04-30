@@ -15,12 +15,24 @@ on:
         description: The channel to create a release or release candidate for.
         required: true
         type: string
+      source_ref:
+        description: Optional git ref to build from, such as refs/heads/byok.
+        type: string
+        default: ""
       build_linux:
         description: Build Linux artifacts.
         type: boolean
         default: true
+      build_linux_arm:
+        description: Build Linux ARM artifacts.
+        type: boolean
+        default: true
       build_windows:
         description: Build Windows artifacts.
+        type: boolean
+        default: true
+      build_windows_arm:
+        description: Build Windows ARM artifacts.
         type: boolean
         default: true
       build_macos:
@@ -35,17 +47,81 @@ on:
         description: Publish this release
         type: boolean
         default: true
+      publish_sentry:
+        description: Publish Sentry releases and debug symbols.
+        type: boolean
+        default: false
+      publish_gcs:
+        description: Upload release artifacts to Google Cloud Storage.
+        type: boolean
+        default: false
+      publish_changelog:
+        description: Generate and upload changelog artifacts.
+        type: boolean
+        default: false
+      notify_slack:
+        description: Send Slack notifications for release failures and changelogs.
+        type: boolean
+        default: false
+      sign_macos:
+        description: Sign and notarize macOS artifacts.
+        type: boolean
+        default: false
+      sign_windows:
+        description: Sign Windows binaries and installer payloads.
+        type: boolean
+        default: false
+      sign_linux:
+        description: Sign Linux packages that support signing.
+        type: boolean
+        default: false
+      runner_macos:
+        description: Runner label for macOS release jobs.
+        type: string
+        default: macos-26-xlarge
+      runner_linux_x86:
+        description: Runner label for Linux x86_64 release jobs.
+        type: string
+        default: namespace-profile-ubuntu-20-04
+      runner_linux_arm:
+        description: Runner label for Linux ARM release jobs.
+        type: string
+        default: namespace-profile-ubuntu-20-04-arm
+      runner_web:
+        description: Runner label for web release jobs.
+        type: string
+        default: namespace-profile-ubuntu-22-04
+      runner_windows:
+        description: Runner label for Windows release jobs.
+        type: string
+        default: windows-latest-large
+      bundle_features:
+        description: Optional additional Cargo features to pass to app bundle builds.
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       channel:
         type: string
         required: true
+      source_ref:
+        description: Optional git ref to build from, such as refs/heads/byok.
+        type: string
+        default: ""
       build_linux:
         description: Build Linux artifacts.
         type: boolean
         default: true
+      build_linux_arm:
+        description: Build Linux ARM artifacts.
+        type: boolean
+        default: true
       build_windows:
         description: Build Windows artifacts.
+        type: boolean
+        default: true
+      build_windows_arm:
+        description: Build Windows ARM artifacts.
         type: boolean
         default: true
       build_macos:
@@ -56,6 +132,58 @@ on:
         description: Build web artifacts.
         type: boolean
         default: true
+      publish_sentry:
+        description: Publish Sentry releases and debug symbols.
+        type: boolean
+        default: false
+      publish_gcs:
+        description: Upload release artifacts to Google Cloud Storage.
+        type: boolean
+        default: false
+      publish_changelog:
+        description: Generate and upload changelog artifacts.
+        type: boolean
+        default: false
+      notify_slack:
+        description: Send Slack notifications for release failures and changelogs.
+        type: boolean
+        default: false
+      sign_macos:
+        description: Sign and notarize macOS artifacts.
+        type: boolean
+        default: false
+      sign_windows:
+        description: Sign Windows binaries and installer payloads.
+        type: boolean
+        default: false
+      sign_linux:
+        description: Sign Linux packages that support signing.
+        type: boolean
+        default: false
+      runner_macos:
+        description: Runner label for macOS release jobs.
+        type: string
+        default: macos-26-xlarge
+      runner_linux_x86:
+        description: Runner label for Linux x86_64 release jobs.
+        type: string
+        default: namespace-profile-ubuntu-20-04
+      runner_linux_arm:
+        description: Runner label for Linux ARM release jobs.
+        type: string
+        default: namespace-profile-ubuntu-20-04-arm
+      runner_web:
+        description: Runner label for web release jobs.
+        type: string
+        default: namespace-profile-ubuntu-22-04
+      runner_windows:
+        description: Runner label for Windows release jobs.
+        type: string
+        default: windows-latest-large
+      bundle_features:
+        description: Optional additional Cargo features to pass to app bundle builds.
+        type: string
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -74,6 +202,8 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref != '' && inputs.source_ref || github.ref }}
 
       - name: Get channel configuration
         id: get-config
@@ -99,7 +229,12 @@ jobs:
         id: create_branch_and_tag
         run: |
           if [[ "${{ steps.set_publish.outputs.should_publish }}" == "true" ]]; then
-            GIT_BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+            if [[ -n "${{ inputs.source_ref }}" ]]; then
+              GIT_BRANCH_NAME="${{ inputs.source_ref }}"
+            else
+              GIT_BRANCH_NAME="${GITHUB_REF}"
+            fi
+            GIT_BRANCH_NAME="${GIT_BRANCH_NAME#refs/heads/}"
             source ./script/create_release_tag_and_branch --channel $CHANNEL --branch-name "$GIT_BRANCH_NAME"
             echo "branch=$(git branch --show-current)" >> $GITHUB_OUTPUT
             echo "tag=$tag" >> $GITHUB_OUTPUT
@@ -125,7 +260,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create Sentry release
-        if: ${{ steps.set_publish.outputs.should_publish == 'true' }}
+        if: ${{ steps.set_publish.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         uses: getsentry/action-release@5657c9e888b4e2cc85f4d29143ea4131fde4a73a # v3.6.0
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_RELEASE_TOKEN }}
@@ -137,7 +272,7 @@ jobs:
 
   release_macos_single_arch:
     name: Build Release (macOS ${{ matrix.dmg_name_suffix }})
-    runs-on: macos-26-xlarge
+    runs-on: ${{ inputs.runner_macos }}
     needs: prepare_release
     if: ${{ inputs.build_macos != false }}
     timeout-minutes: 60
@@ -186,7 +321,16 @@ jobs:
       - name: Build ${{ matrix.arch }} bundle
         id: bundle_app
         run: |
-          script/bundle --read-passwords-from-env --channel $CHANNEL --arch ${{ matrix.arch }} --dmg-name-suffix "${{ matrix.dmg_name_suffix }}"
+          BUNDLE_ARGS=(--channel "$CHANNEL" --arch "${{ matrix.arch }}" --dmg-name-suffix "${{ matrix.dmg_name_suffix }}")
+          if [[ -n "${{ inputs.bundle_features }}" ]]; then
+            BUNDLE_ARGS=(--features "${{ inputs.bundle_features }}" "${BUNDLE_ARGS[@]}")
+          fi
+          if [[ "${{ inputs.sign_macos }}" == "true" ]]; then
+            BUNDLE_ARGS=(--read-passwords-from-env "${BUNDLE_ARGS[@]}")
+          else
+            BUNDLE_ARGS=(--nosign "${BUNDLE_ARGS[@]}")
+          fi
+          script/bundle "${BUNDLE_ARGS[@]}"
         shell: bash
         env:
           CHANNEL: ${{ steps.get-config.outputs.channel }}
@@ -206,12 +350,12 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true }}
         with:
           credentials_json: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
 
       - name: Upload DMG to Google Cloud Storage
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true }}
         uses: google-github-actions/upload-cloud-storage@e95a15f226403ed658d3e65f40205649f342ba2c # v1
         with:
           path: ${{ steps.bundle_app.outputs.dmg_path }}
@@ -227,7 +371,7 @@ jobs:
           path: ${{ steps.bundle_app.outputs.dmg_path }}
 
       - name: Set up Sentry CLI
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         uses: matbour/setup-sentry-cli@3e938c54b3018bdd019973689ef984e033b0454b # v2.0.0
         with:
           token: ${{ secrets.SENTRY_RELEASE_TOKEN }}
@@ -235,7 +379,7 @@ jobs:
           project: ${{ steps.get-config.outputs.sentry_project }}
 
       - name: Upload debug symbols from frameworks to Sentry
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         run: |
           script/sentry_upload_dif.sh
         shell: bash
@@ -265,7 +409,7 @@ jobs:
 
   release_macos_universal:
     name: Build Release (macOS Universal)
-    runs-on: macos-26-xlarge
+    runs-on: ${{ inputs.runner_macos }}
     needs: [prepare_release, release_macos_single_arch]
     if: ${{ inputs.build_macos != false }}
     timeout-minutes: 60
@@ -320,7 +464,16 @@ jobs:
       - name: Bundle universal app
         id: bundle_app
         run: |
-          script/bundle --skip-build --read-passwords-from-env --channel $CHANNEL
+          BUNDLE_ARGS=(--skip-build --channel "$CHANNEL")
+          if [[ -n "${{ inputs.bundle_features }}" ]]; then
+            BUNDLE_ARGS=(--features "${{ inputs.bundle_features }}" "${BUNDLE_ARGS[@]}")
+          fi
+          if [[ "${{ inputs.sign_macos }}" == "true" ]]; then
+            BUNDLE_ARGS=(--read-passwords-from-env "${BUNDLE_ARGS[@]}")
+          else
+            BUNDLE_ARGS=(--nosign "${BUNDLE_ARGS[@]}")
+          fi
+          script/bundle "${BUNDLE_ARGS[@]}"
         shell: bash
         env:
           CHANNEL: ${{ steps.get-config.outputs.channel }}
@@ -332,7 +485,7 @@ jobs:
           WARP_NOTARIZATION_PASSWORD: ${{ secrets.WARP_NOTARIZATION_PASSWORD }}
 
       - name: Set up Sentry CLI
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         uses: matbour/setup-sentry-cli@3e938c54b3018bdd019973689ef984e033b0454b # v2.0.0
         with:
           token: ${{ secrets.SENTRY_RELEASE_TOKEN }}
@@ -340,7 +493,7 @@ jobs:
           project: ${{ steps.get-config.outputs.sentry_project }}
 
       - name: Upload debugging symbols to Sentry
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         run: |
           script/sentry_upload_dif.sh
         shell: bash
@@ -381,12 +534,12 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true }}
         with:
           credentials_json: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
 
       - name: Upload DMG to Google Cloud Storage
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true }}
         uses: google-github-actions/upload-cloud-storage@e95a15f226403ed658d3e65f40205649f342ba2c # v1
         with:
           path: ${{ steps.bundle_app.outputs.dmg_path }}
@@ -406,7 +559,7 @@ jobs:
 
   release_macos_cli:
     name: Build Release (macOS CLI ${{ matrix.arch }})
-    runs-on: macos-26-xlarge
+    runs-on: ${{ inputs.runner_macos }}
     needs: prepare_release
     if: ${{ inputs.build_macos != false }}
     timeout-minutes: 60
@@ -447,7 +600,13 @@ jobs:
       - name: Build ${{ matrix.arch }} binary
         id: bundle_cli
         run: |
-          script/bundle --read-passwords-from-env --channel $CHANNEL --arch ${{ matrix.arch }} --artifact cli
+          BUNDLE_ARGS=(--channel "$CHANNEL" --arch "${{ matrix.arch }}" --artifact cli)
+          if [[ "${{ inputs.sign_macos }}" == "true" ]]; then
+            BUNDLE_ARGS=(--read-passwords-from-env "${BUNDLE_ARGS[@]}")
+          else
+            BUNDLE_ARGS=(--nosign "${BUNDLE_ARGS[@]}")
+          fi
+          script/bundle "${BUNDLE_ARGS[@]}"
         shell: bash
         env:
           CHANNEL: ${{ steps.get-config.outputs.channel }}
@@ -472,12 +631,12 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true }}
         with:
           credentials_json: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
 
       - name: Upload CLI to Google Cloud Storage
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true }}
         uses: google-github-actions/upload-cloud-storage@e95a15f226403ed658d3e65f40205649f342ba2c # v1
         with:
           path: oz-${{ steps.get-config.outputs.channel }}-macos-${{ matrix.arch }}.tar.gz
@@ -493,7 +652,7 @@ jobs:
           path: oz-${{ steps.get-config.outputs.channel }}-macos-${{ matrix.arch }}.tar.gz
 
       - name: Set up Sentry CLI
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         uses: matbour/setup-sentry-cli@3e938c54b3018bdd019973689ef984e033b0454b # v2.0.0
         with:
           token: ${{ secrets.SENTRY_RELEASE_TOKEN }}
@@ -501,7 +660,7 @@ jobs:
           project: ${{ steps.get-config.outputs.sentry_project }}
 
       - name: Upload debugging symbols to Sentry
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         run: |
           script/sentry_upload_dif.sh
         shell: bash
@@ -510,7 +669,7 @@ jobs:
 
   release_linux_x86:
     name: Build Release (Linux x86_64)
-    runs-on: namespace-profile-ubuntu-20-04
+    runs-on: ${{ inputs.runner_linux_x86 }}
     needs: prepare_release
     if: ${{ inputs.build_linux != false }}
     timeout-minutes: 60
@@ -548,6 +707,7 @@ jobs:
           channel: ${{ inputs.channel }}
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        if: ${{ inputs.publish_gcs == true || inputs.sign_linux == true }}
         with:
           credentials_json: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
 
@@ -555,6 +715,7 @@ jobs:
         run: script/linux/install_linuxdeploy
 
       - name: Load PGP signing key and passphrase
+        if: ${{ inputs.sign_linux == true }}
         run: |
           mkdir -p ~/.gnupg
           echo "default-cache-ttl 7200" >> ~/.gnupg/gpg-agent.conf
@@ -596,7 +757,11 @@ jobs:
         run: |
           # Build everything but the arch package, as we need to build it
           # within a Docker container.
-          script/bundle --channel $CHANNEL --packages appimage,deb,rpm
+          BUNDLE_ARGS=(--channel "$CHANNEL" --packages appimage,deb,rpm)
+          if [[ -n "${{ inputs.bundle_features }}" ]]; then
+            BUNDLE_ARGS=(--features "${{ inputs.bundle_features }}" "${BUNDLE_ARGS[@]}")
+          fi
+          script/bundle "${BUNDLE_ARGS[@]}"
         shell: bash
         env:
           CHANNEL: ${{ steps.get-config.outputs.channel }}
@@ -610,6 +775,7 @@ jobs:
           arch: x86_64
 
       - name: Sign Arch Linux packages
+        if: ${{ inputs.sign_linux == true }}
         run: |
           ./script/linux/sign_arch_packages "$PKGDIR"
         shell: bash
@@ -617,7 +783,7 @@ jobs:
           PKGDIR: ${{ steps.bundle_app.outputs.packages_dir }}
 
       - name: Set up Sentry CLI
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         uses: matbour/setup-sentry-cli@3e938c54b3018bdd019973689ef984e033b0454b # v2.0.0
         with:
           token: ${{ secrets.SENTRY_RELEASE_TOKEN }}
@@ -625,7 +791,7 @@ jobs:
           project: ${{ steps.get-config.outputs.sentry_project }}
 
       - name: Upload debugging symbols to Sentry
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         run: |
           script/sentry_upload_dif.sh
         shell: bash
@@ -642,7 +808,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload packages to Google Cloud Storage
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true }}
         uses: google-github-actions/upload-cloud-storage@e95a15f226403ed658d3e65f40205649f342ba2c # v1
         with:
           path: ${{ steps.bundle_app.outputs.packages_dir }}
@@ -665,7 +831,7 @@ jobs:
 
   release_linux_cli_x86:
     name: Build Release (Linux CLI x86_64)
-    runs-on: namespace-profile-ubuntu-20-04
+    runs-on: ${{ inputs.runner_linux_x86 }}
     needs: prepare_release
     if: ${{ inputs.build_linux != false }}
     timeout-minutes: 60
@@ -698,10 +864,12 @@ jobs:
           channel: ${{ inputs.channel }}
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        if: ${{ inputs.publish_gcs == true || inputs.sign_linux == true }}
         with:
           credentials_json: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
 
       - name: Load PGP signing key and passphrase
+        if: ${{ inputs.sign_linux == true }}
         run: |
           mkdir -p ~/.gnupg
           echo "default-cache-ttl 7200" >> ~/.gnupg/gpg-agent.conf
@@ -762,6 +930,7 @@ jobs:
           artifact: cli
 
       - name: Sign Arch Linux packages
+        if: ${{ inputs.sign_linux == true }}
         run: |
           ./script/linux/sign_arch_packages "$PKGDIR"
         shell: bash
@@ -769,7 +938,7 @@ jobs:
           PKGDIR: ${{ steps.bundle_cli.outputs.packages_dir }}
 
       - name: Set up Sentry CLI
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         uses: matbour/setup-sentry-cli@3e938c54b3018bdd019973689ef984e033b0454b # v2.0.0
         with:
           token: ${{ secrets.SENTRY_RELEASE_TOKEN }}
@@ -777,7 +946,7 @@ jobs:
           project: ${{ steps.get-config.outputs.sentry_project }}
 
       - name: Upload debugging symbols to Sentry
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         run: |
           script/sentry_upload_dif.sh
         shell: bash
@@ -794,7 +963,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload CLI packages to Google Cloud Storage
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true }}
         uses: google-github-actions/upload-cloud-storage@e95a15f226403ed658d3e65f40205649f342ba2c # v1
         with:
           path: ${{ steps.bundle_cli.outputs.packages_dir }}
@@ -817,7 +986,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload CLI tar.gz to Google Cloud Storage
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true }}
         uses: google-github-actions/upload-cloud-storage@e95a15f226403ed658d3e65f40205649f342ba2c # v1
         with:
           path: oz-${{ steps.get-config.outputs.channel }}-linux-x86_64.tar.gz
@@ -836,9 +1005,9 @@ jobs:
 
   build_linux_arm_binaries:
     name: Build Release (Linux ARM)
-    runs-on: namespace-profile-ubuntu-20-04-arm
+    runs-on: ${{ inputs.runner_linux_arm }}
     needs: prepare_release
-    if: ${{ inputs.build_linux != false }}
+    if: ${{ inputs.build_linux != false && inputs.build_linux_arm != false }}
     timeout-minutes: 60
     env:
       # Automatically extract AppImages before running them instead of mounting
@@ -885,6 +1054,7 @@ jobs:
           channel: ${{ inputs.channel }}
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        if: ${{ inputs.publish_gcs == true || inputs.sign_linux == true }}
         with:
           credentials_json: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
 
@@ -901,7 +1071,11 @@ jobs:
         id: build_app
         run: |
           # Build the code, but only bundle the appimage
-          script/bundle --channel $CHANNEL --packages appimage
+          BUNDLE_ARGS=(--channel "$CHANNEL" --packages appimage)
+          if [[ -n "${{ inputs.bundle_features }}" ]]; then
+            BUNDLE_ARGS=(--features "${{ inputs.bundle_features }}" "${BUNDLE_ARGS[@]}")
+          fi
+          script/bundle "${BUNDLE_ARGS[@]}"
         shell: bash
         env:
           CHANNEL: ${{ steps.get-config.outputs.channel }}
@@ -930,9 +1104,9 @@ jobs:
 
   build_linux_cli_arm_binaries:
     name: Build Release (Linux CLI ARM)
-    runs-on: namespace-profile-ubuntu-20-04-arm
+    runs-on: ${{ inputs.runner_linux_arm }}
     needs: prepare_release
-    if: ${{ inputs.build_linux != false }}
+    if: ${{ inputs.build_linux != false && inputs.build_linux_arm != false }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -963,6 +1137,7 @@ jobs:
           channel: ${{ inputs.channel }}
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        if: ${{ inputs.publish_gcs == true || inputs.sign_linux == true }}
         with:
           credentials_json: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
 
@@ -1007,9 +1182,9 @@ jobs:
   # because the steps here were hard to get running on the self-hosted runners.
   release_linux_arm:
     name: Bundle Release (Linux ARM)
-    runs-on: namespace-profile-ubuntu-20-04
+    runs-on: ${{ inputs.runner_linux_x86 }}
     needs: [ prepare_release, build_linux_arm_binaries, build_linux_cli_arm_binaries ]
-    if: ${{ inputs.build_linux != false }}
+    if: ${{ inputs.build_linux != false && inputs.build_linux_arm != false }}
     timeout-minutes: 60
     steps:
       - name: Checkout sources
@@ -1025,11 +1200,12 @@ jobs:
           channel: ${{ inputs.channel }}
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        if: ${{ inputs.publish_gcs == true || inputs.sign_linux == true }}
         with:
           credentials_json: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
       
       - name: Set up Sentry CLI
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         uses: matbour/setup-sentry-cli@3e938c54b3018bdd019973689ef984e033b0454b # v2.0.0
         with:
           token: ${{ secrets.SENTRY_RELEASE_TOKEN }}
@@ -1062,6 +1238,7 @@ jobs:
           ./script/install_cargo_release_deps --no-build-deps
 
       - name: Load PGP signing key and passphrase
+        if: ${{ inputs.sign_linux == true }}
         run: |
           mkdir -p ~/.gnupg
           echo "default-cache-ttl 7200" >> ~/.gnupg/gpg-agent.conf
@@ -1117,7 +1294,11 @@ jobs:
         run: |
           # Bundle everything but the arch package, as we need to bundle it
           # within a Docker container.
-          script/bundle --channel $CHANNEL --skip-build --packages deb,rpm --arch aarch64
+          BUNDLE_ARGS=(--channel "$CHANNEL" --skip-build --packages deb,rpm --arch aarch64)
+          if [[ -n "${{ inputs.bundle_features }}" ]]; then
+            BUNDLE_ARGS=(--features "${{ inputs.bundle_features }}" "${BUNDLE_ARGS[@]}")
+          fi
+          script/bundle "${BUNDLE_ARGS[@]}"
         shell: bash
         env:
           CHANNEL: ${{ steps.get-config.outputs.channel }}
@@ -1131,7 +1312,7 @@ jobs:
           arch: aarch64
           
       - name: Upload app debugging symbols to Sentry
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         # Important: we have to do this before the binary is overwritten by the CLI version, which has the same filename
         run: |
           script/sentry_upload_dif.sh
@@ -1175,7 +1356,7 @@ jobs:
           artifact: cli
 
       - name: Upload CLI debugging symbols to Sentry
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         run: |
           script/sentry_upload_dif.sh
         env:
@@ -1185,6 +1366,7 @@ jobs:
       # Common uploading steps
 
       - name: Sign Arch Linux packages
+        if: ${{ inputs.sign_linux == true }}
         run: |
           # We technically only need to run `sign_arch_packages` once, as $APP_PKGDIR and $CLI_PKGDIR should be the same.
           ./script/linux/sign_arch_packages "$APP_PKGDIR"
@@ -1219,7 +1401,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload app packages to Google Cloud Storage
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true }}
         uses: google-github-actions/upload-cloud-storage@e95a15f226403ed658d3e65f40205649f342ba2c # v1
         with:
           path: ${{ steps.bundle_app.outputs.packages_dir }}
@@ -1233,7 +1415,7 @@ jobs:
 
       - name: Upload CLI packages to Google Cloud Storage
         uses: google-github-actions/upload-cloud-storage@e95a15f226403ed658d3e65f40205649f342ba2c # v1
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && steps.bundle_cli.outputs.packages_dir != steps.bundle_app.outputs.packages_dir }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true && steps.bundle_cli.outputs.packages_dir != steps.bundle_app.outputs.packages_dir }}
         with:
           path: ${{ steps.bundle_cli.outputs.packages_dir }}
           parent: false
@@ -1245,7 +1427,7 @@ jobs:
             cache-control: ${{ steps.get-config.outputs.gcs_cache_control_value }}
 
       - name: Upload CLI tar.gz to Google Cloud Storage
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true }}
         uses: google-github-actions/upload-cloud-storage@e95a15f226403ed658d3e65f40205649f342ba2c # v1
         with:
           path: oz-${{ steps.get-config.outputs.channel }}-linux-aarch64.tar.gz
@@ -1264,7 +1446,7 @@ jobs:
 
   release_web:
     name: Build Release (Web)
-    runs-on: namespace-profile-ubuntu-22-04
+    runs-on: ${{ inputs.runner_web }}
     needs: prepare_release
     if: ${{ inputs.build_web != false }}
     timeout-minutes: 60
@@ -1305,7 +1487,7 @@ jobs:
         shell: bash
 
       - name: Set up Sentry CLI
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         uses: matbour/setup-sentry-cli@3e938c54b3018bdd019973689ef984e033b0454b # v2.0.0
         with:
           token: ${{ secrets.SENTRY_RELEASE_TOKEN }}
@@ -1313,7 +1495,7 @@ jobs:
           project: ${{ steps.get-config.outputs.sentry_project }}
 
       - name: Upload debugging symbols to Sentry
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         run: |
           script/sentry_upload_dif.sh
         shell: bash
@@ -1330,12 +1512,12 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true }}
         with:
           credentials_json: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
 
       - name: Upload packages to Google Cloud Storage
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true }}
         uses: google-github-actions/upload-cloud-storage@e95a15f226403ed658d3e65f40205649f342ba2c # v1
         with:
           path: ${{ steps.bundle_app.outputs.packages_dir }}
@@ -1352,7 +1534,7 @@ jobs:
             content-encoding: br
 
       - name: Upload assets to Google Cloud Storage
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true }}
         uses: google-github-actions/upload-cloud-storage@e95a15f226403ed658d3e65f40205649f342ba2c # v1
         with:
           path: ${{ steps.bundle_app.outputs.assets_dir }}
@@ -1378,17 +1560,13 @@ jobs:
 
   release_windows:
     name: Build Release (Windows ${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ inputs.runner_windows }}
     needs: prepare_release
     if: ${{ inputs.build_windows != false }}
     timeout-minutes: 150
     strategy:
       matrix:
-        include:
-          - arch: x64
-            runner: windows-latest-large
-          - arch: arm64
-            runner: windows-latest-large
+        include: ${{ fromJSON(inputs.build_windows_arm && '[{"arch":"x64"},{"arch":"arm64"}]' || '[{"arch":"x64"}]') }}
     env:
       TRUSTED_SIGNING_ENDPOINT: https://eus.codesigning.azure.net/
       TRUSTED_SIGNING_ACCOUNT: warpdotdev
@@ -1419,13 +1597,19 @@ jobs:
 
       - name: Build binary
         id: build_binary
-        run: script/bundle -Channel $CHANNEL -skip_build_installer --arch ${{ matrix.arch }}
+        run: |
+          BUNDLE_ARGS=(-Channel "$CHANNEL" -skip_build_installer --arch "${{ matrix.arch }}")
+          if [[ -n "${{ inputs.bundle_features }}" ]]; then
+            BUNDLE_ARGS+=(-features "${{ inputs.bundle_features }}")
+          fi
+          script/bundle "${BUNDLE_ARGS[@]}"
         shell: bash
         env:
           CHANNEL: ${{ steps.get-config.outputs.channel }}
           GIT_RELEASE_TAG: ${{ needs.prepare_release.outputs.release_tag }}
 
       - name: Sign the executables with Azure Trusted Signing
+        if: ${{ inputs.sign_windows == true }}
         uses: azure/artifact-signing-action@b443cf8ea4124818d2ea9f043cba29fc3ec47b16 # v1.2.0
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -1452,6 +1636,7 @@ jobs:
       # https://github.com/warpdotdev/Warp/issues/8794
       - name: Build sign-tool command for Inno Setup
         id: setup_signing
+        if: ${{ inputs.sign_windows == true }}
         shell: pwsh
         run: |
           $Dlib = (Get-ChildItem -Recurse "$env:LOCALAPPDATA" -Filter "Azure.CodeSigning.Dlib.dll" -ErrorAction SilentlyContinue |
@@ -1472,7 +1657,12 @@ jobs:
 
       - name: Bundle app
         id: bundle_app
-        run: script/bundle -Channel $CHANNEL -skip_build_binary --arch ${{ matrix.arch }}
+        run: |
+          BUNDLE_ARGS=(-Channel "$CHANNEL" -skip_build_binary --arch "${{ matrix.arch }}")
+          if [[ -n "${{ inputs.bundle_features }}" ]]; then
+            BUNDLE_ARGS+=(-features "${{ inputs.bundle_features }}")
+          fi
+          script/bundle "${BUNDLE_ARGS[@]}"
         shell: bash
         env:
           CHANNEL: ${{ steps.get-config.outputs.channel }}
@@ -1483,7 +1673,7 @@ jobs:
           SIGN_TOOL_CMD: ${{ steps.setup_signing.outputs.sign_tool_cmd }}
 
       - name: Set up Sentry CLI
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         uses: matbour/setup-sentry-cli@3e938c54b3018bdd019973689ef984e033b0454b # v2.0.0
         with:
           token: ${{ secrets.SENTRY_RELEASE_TOKEN }}
@@ -1491,7 +1681,7 @@ jobs:
           project: ${{ steps.get-config.outputs.sentry_project }}
 
       - name: Upload binary to Sentry
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         run: |
           script/sentry_upload_dif.sh
         shell: bash
@@ -1499,7 +1689,7 @@ jobs:
           DEBUG_FILE_OR_FOLDER_PATH: ${{ steps.build_binary.outputs.binary_path }}
 
       - name: Upload debugging symbols to Sentry
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_sentry == true }}
         run: |
           script/sentry_upload_dif.sh
         shell: bash
@@ -1516,12 +1706,12 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true }}
         with:
           credentials_json: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
 
       - name: Upload installer to Google Cloud Storage
-        if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+        if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_gcs == true }}
         uses: google-github-actions/upload-cloud-storage@e95a15f226403ed658d3e65f40205649f342ba2c # v1
         with:
           path: ${{ steps.bundle_app.outputs.installer_path }}
@@ -1552,7 +1742,7 @@ jobs:
       - release_linux_cli_x86
       - release_web
       - release_windows
-    if: ${{ always() && needs.prepare_release.outputs.should_publish == 'true' }}
+    if: ${{ always() && needs.prepare_release.outputs.should_publish == 'true' && inputs.notify_slack == true }}
     steps:
       - name: Figure out which releases failed, if any
         id: failed_releases
@@ -1602,7 +1792,7 @@ jobs:
 
   generate_changelogs:
     name: Generate Changelogs
-    if: ${{ needs.prepare_release.outputs.should_publish == 'true' }}
+    if: ${{ needs.prepare_release.outputs.should_publish == 'true' && inputs.publish_changelog == true }}
     runs-on: ubuntu-latest
     needs:
       - prepare_release
@@ -1618,6 +1808,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         name: Checkout sources
         with:
+          ref: ${{ needs.prepare_release.outputs.release_branch }}
           # Fetch history for all tags and branches so we can compare revisions
           # in order to generate the changelog.
           fetch-depth: 0
@@ -1703,7 +1894,7 @@ jobs:
       - name: Post to a Slack channel
         id: slack
         uses: slackapi/slack-github-action@410ae57cff5c6b682b106440be0e6c7eb8c98c9d # v1.16.0
-        if: ${{ steps.build_slack_payload.outputs.has_content == 'true' }}
+        if: ${{ steps.build_slack_payload.outputs.has_content == 'true' && inputs.notify_slack == true }}
         # Continue on with the rest of the workflow, even if we fail to send the
         # changelog info to Slack.  (We still want to stick the changelog JSON
         # in Cloud Storage.)
@@ -1739,10 +1930,12 @@ jobs:
         shell: bash
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        if: ${{ inputs.publish_gcs == true }}
         with:
           credentials_json: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
 
       - name: Upload changelog.json to Google Cloud Storage
+        if: ${{ inputs.publish_gcs == true }}
         uses: google-github-actions/upload-cloud-storage@e95a15f226403ed658d3e65f40205649f342ba2c # v1
         with:
           path: changelog.json

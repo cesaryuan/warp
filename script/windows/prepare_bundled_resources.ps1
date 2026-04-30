@@ -24,6 +24,7 @@ Param(
 )
 
 $ErrorActionPreference = 'Stop'
+$TotalStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = (Get-Item "$ScriptDir\..\.." | Select-Object -ExpandProperty FullName)
@@ -45,10 +46,13 @@ $BundledSource = Join-Path $ResourcesSource 'bundled'
 if (Test-Path $BundledSource -PathType Container) {
     $BundledDestination = Join-Path $DestinationDir 'bundled'
     Write-Output "Copying bundled resources to $BundledDestination"
+    $CopyResourcesStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     if (Test-Path $BundledDestination -PathType Container) {
         Remove-Item -Path $BundledDestination -Recurse -Force
     }
     Copy-Item -Path $BundledSource -Destination $BundledDestination -Recurse -Force
+    $CopyResourcesStopwatch.Stop()
+    Write-Output "Copied bundled resources in $($CopyResourcesStopwatch.Elapsed)"
 } else {
     Write-Warning "No bundled directory found at $BundledSource"
 }
@@ -122,6 +126,7 @@ if ($Channel -and (Test-Path $GatedSource -PathType Container)) {
 # to the repo alongside the component and add an entry here.
 # Cross-platform components:
 $AdditionalLicenses = @(
+    @{ Name = 'Alacritty (alacritty_terminal)'; License = 'Apache-2.0'; Path = 'crates\warp_terminal\src\model\LICENSE-ALACRITTY' },
     @{ Name = 'Hack Font'; License = 'MIT'; Path = 'app\assets\bundled\fonts\hack\LICENSE.md' },
     @{ Name = 'Roboto Font'; License = 'SIL Open Font License'; Path = 'app\assets\bundled\fonts\roboto\LICENSE.txt' },
     @{ Name = 'bash-preexec'; License = 'MIT'; Path = 'app\assets\bundled\bootstrap\bash-preexec-LICENSE.md' },
@@ -138,11 +143,14 @@ $AdditionalLicenses += @(
 
 $LicensesOutput = Join-Path $DestinationDir 'THIRD_PARTY_LICENSES.txt'
 Write-Output "Generating third-party licenses at $LicensesOutput"
+$LicenseStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 cargo about generate --workspace --manifest-path "$RepoRoot\Cargo.toml" -c "$RepoRoot\about.toml" -o "$LicensesOutput" "$RepoRoot\about.hbs"
+$LicenseStopwatch.Stop()
 if (-Not $?) {
     Write-Error 'Failed to generate third-party licenses'
     exit 1
 }
+Write-Output "Generated third-party licenses in $($LicenseStopwatch.Elapsed)"
 
 # Append additional (non-Cargo) third-party licenses.
 foreach ($entry in $AdditionalLicenses) {
@@ -162,6 +170,7 @@ foreach ($entry in $AdditionalLicenses) {
 if ($env:SKIP_SETTINGS_SCHEMA -ne '1') {
     $SchemaOutput = Join-Path $DestinationDir 'settings_schema.json'
     Write-Output "Generating settings schema at $SchemaOutput"
+    $SchemaStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
     $SchemaCmd = @('run')
     if ($CargoProfile) {
@@ -174,10 +183,13 @@ if ($env:SKIP_SETTINGS_SCHEMA -ne '1') {
     $SchemaCmd += $SchemaOutput
 
     & cargo @SchemaCmd
+    $SchemaStopwatch.Stop()
     if (-Not $?) {
         Write-Error 'Failed to generate settings schema'
         exit 1
     }
+    Write-Output "Generated settings schema in $($SchemaStopwatch.Elapsed)"
 }
 
-Write-Output "Successfully prepared bundled resources in $DestinationDir"
+$TotalStopwatch.Stop()
+Write-Output "Successfully prepared bundled resources in $DestinationDir in $($TotalStopwatch.Elapsed)"

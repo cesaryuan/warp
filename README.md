@@ -21,15 +21,39 @@
 > [!NOTE]
 > OpenAI is the founding sponsor of the new, open-source Warp repository, and the new agentic management workflows are powered by GPT models.
 
+> [!IMPORTANT]
+> This repository is a modified Warp fork rather than the official upstream Warp repository. It is based on Warp, but includes custom behavior focused on making BYOK and OpenAI-compatible backends more flexible for all users.
+
 <h1></h1>
 
 ## About
 
 [Warp](https://www.warp.dev) is an agentic development environment, born out of the terminal. Use Warp's built-in coding agent, or bring your own CLI agent (Claude Code, Codex, Gemini CLI, and others).
 
+This fork is a modded build of Warp aimed at relaxing some upstream restrictions around BYOK and OpenAI-compatible integrations.
+
+## Key Features
+
+This fork currently includes the following custom changes on top of upstream Warp:
+
+* BYOK (Bring Your Own API Key) is enabled for all users instead of being limited by the original billing-gated behavior.
+* Warp Agent can use a custom OpenAI-compatible `base URL`, making it easier to connect to self-hosted gateways, proxies, or third-party compatible providers.
+* When the local OpenAI-compatible backend is enabled, Warp Agent requests can be sent directly from the client to the configured `/v1/responses` endpoint instead of going through Warp's hosted `/ai/multi-agent` service.
+* The local OpenAI-compatible backend now supports reasoning/thinking summaries in the Warp UI, including streaming updates and the final `Thought for N seconds` style duration display.
+* Multi-turn local OpenAI-compatible sessions now preserve reasoning context more accurately by carrying forward reasoning items, including encrypted reasoning content required by the Responses API for continued tool-using and reasoning flows.
+* This branch has also been refreshed with the latest upstream Warp changes from the recent `byok` and `master` merges, so it keeps the custom BYOK/OpenAI-compatible behavior while staying aligned with newer upstream fixes and maintenance updates.
+
 ## Installation
 
 You can [download Warp](https://www.warp.dev/download) and [read our docs](https://docs.warp.dev/) for platform-specific instructions.
+
+## Warp Contributions Overview Dashboard
+
+Explore [build.warp.dev](https://build.warp.dev) to:
+- Watch thousands of Oz agents triage issues, write specs, implement changes, and review PRs
+- View top contributors and in-flight features
+- Track your own issues with GitHub sign-in
+- Click into active agent sessions in a web-compiled Warp terminal
 
 ## Licensing
 
@@ -40,6 +64,9 @@ The rest of the code in this repository is licensed under the [AGPL v3](LICENSE-
 ## Open Source & Contributing
 
 Warp's client codebase is open source and lives in this repository. We welcome community contributions and have designed a lightweight workflow to help new contributors get started. For the full contribution flow, read our [CONTRIBUTING.md](CONTRIBUTING.md) guide.
+
+> [!TIP]
+> **Chat with contributors and the Warp team** in the [`#oss-contributors`](https://warpcommunity.slack.com/archives/C0B0LM8N4DB) Slack channel — a good place for ad-hoc questions, design discussion, and pairing with maintainers. New here? [Join the Warp Slack community](https://go.warp.dev/join-preview) first, then jump into `#oss-contributors`.
 
 ### Issue to PR
 
@@ -66,7 +93,7 @@ Interested in joining the team? See our [open roles](https://www.warp.dev/career
 ## Support and Questions
 
 1. See our [docs](https://docs.warp.dev/) for a comprehensive guide to Warp's features.
-2. Join our [Slack Community](https://go.warp.dev/join-preview) to connect with other users and get help from the Warp team.
+2. Join our [Slack Community](https://go.warp.dev/join-preview) to connect with other users and get help from the Warp team — contributors hang out in [`#oss-contributors`](https://warpcommunity.slack.com/archives/C0B0LM8N4DB).
 3. Try our [Preview build](https://www.warp.dev/download-preview) to test the latest experimental features.
 4. Mention **@oss-maintainers** on any issue to escalate to the team — for example, if you encounter problems with the automated agents.
 
