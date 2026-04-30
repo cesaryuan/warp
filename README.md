@@ -21,11 +21,24 @@
 > [!NOTE]
 > OpenAI is the founding sponsor of the new, open-source Warp repository, and the new agentic management workflows are powered by GPT models.
 
+> [!IMPORTANT]
+> This repository is a modified Warp fork rather than the official upstream Warp repository. It is based on Warp, but includes custom behavior focused on making BYOK and OpenAI-compatible backends more flexible for all users.
+
 <h1></h1>
 
 ## About
 
 [Warp](https://www.warp.dev) is an agentic development environment, born out of the terminal. Use Warp's built-in coding agent, or bring your own CLI agent (Claude Code, Codex, Gemini CLI, and others).
+
+This fork is a modded build of Warp aimed at relaxing some upstream restrictions around BYOK and OpenAI-compatible integrations.
+
+## Current Modifications
+
+This fork currently includes the following custom changes on top of upstream Warp:
+
+* BYOK (Bring Your Own API Key) is enabled for all users instead of being limited by the original billing-gated behavior.
+* Warp Agent can use a custom OpenAI-compatible `base URL`, making it easier to connect to self-hosted gateways, proxies, or third-party compatible providers.
+* When the local OpenAI-compatible backend is enabled, Warp Agent requests can be sent directly from the client to the configured `/v1/responses` endpoint instead of going through Warp's hosted `/ai/multi-agent` service.
 
 ## Installation
 
