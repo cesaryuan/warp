@@ -1605,7 +1605,7 @@ jobs:
           )
           if ('${{ inputs.bundle_features }}' -ne '') {
             $bundleArgs += @('-features', '${{ inputs.bundle_features }}')
-          fi
+          }
           & ./script/windows/bundle.ps1 @bundleArgs
         shell: pwsh
         env:
@@ -1669,7 +1669,7 @@ jobs:
           )
           if ('${{ inputs.bundle_features }}' -ne '') {
             $bundleArgs += @('-features', '${{ inputs.bundle_features }}')
-          fi
+          }
           & ./script/windows/bundle.ps1 @bundleArgs
         shell: pwsh
         env:
