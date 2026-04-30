@@ -74,6 +74,7 @@ on:
         default: ubuntu-22.04
 
 permissions:
+  actions: read
   contents: write
 
 concurrency:
@@ -126,9 +127,72 @@ jobs:
           git merge --no-ff --no-edit "$UPSTREAM_COMMIT"
           git push origin HEAD:refs/heads/master
 
+  resolve_windows_runner:
+    name: Resolve Windows runner
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'release_current_master') }}
+    runs-on: ubuntu-latest
+    outputs:
+      runner_windows: ${{ steps.resolve.outputs.runner_windows }}
+    steps:
+      - name: Resolve preferred Windows runner
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FALLBACK_RUNNER: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_windows || 'windows-latest' }}
+          PREFERRED_SELF_HOSTED_LABEL: warp-win-x64
+        run: |
+          if [[ "$FALLBACK_RUNNER" != "windows-latest" ]]; then
+            echo "Using explicitly requested Windows runner: $FALLBACK_RUNNER"
+            echo "runner_windows=$FALLBACK_RUNNER" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          fallback = os.environ["FALLBACK_RUNNER"]
+          preferred = os.environ["PREFERRED_SELF_HOSTED_LABEL"]
+
+          url = f"https://api.github.com/repos/{repo}/actions/runners?per_page=100"
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "warp-runner-resolution",
+              },
+          )
+
+          with urllib.request.urlopen(request, timeout=30) as response:
+              payload = json.load(response)
+
+          runners = payload.get("runners", [])
+          selected = fallback
+
+          for runner in runners:
+              labels = {label.get("name") for label in runner.get("labels", [])}
+              if (
+                  preferred in labels
+                  and runner.get("status") == "online"
+                  and not runner.get("busy", False)
+              ):
+                  selected = preferred
+                  break
+
+          print(f"Selected Windows runner: {selected}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"runner_windows={selected}\n")
+          PY
+
   create_release:
     name: Create OSS release from master
     if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'release_current_master') }}
+    needs: resolve_windows_runner
     uses: ./.github/workflows/create_release.yml
     with:
       channel: oss
@@ -151,6 +215,6 @@ jobs:
       runner_linux_x86: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_linux_x86 || 'ubuntu-latest' }}
       runner_linux_arm: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_linux_arm || 'ubuntu-24.04-arm' }}
       runner_web: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_web || 'ubuntu-22.04' }}
-      runner_windows: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_windows || 'windows-latest' }}
+      runner_windows: ${{ needs.resolve_windows_runner.outputs.runner_windows }}
       bundle_features: nld_onnx_model
     secrets: inherit
