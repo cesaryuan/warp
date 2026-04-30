@@ -13,7 +13,7 @@ on:
         description: Sync upstream stable into master, or release the current master branch as OSS.
         required: true
         type: choice
-        default: sync_upstream
+        default: release_current_master
         options:
           - sync_upstream
           - release_current_master
