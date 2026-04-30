@@ -9,7 +9,9 @@ mod tool_schemas;
 mod types;
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use async_stream::stream;
@@ -20,14 +22,20 @@ use parking_lot::FairMutex;
 use reqwest_eventsource::Event as EventSourceEvent;
 use uuid::Uuid;
 use warp_multi_agent_api as api;
+use warpui::duration_with_jitter;
+use warpui::r#async::Timer;
 
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::task::TaskId;
+use crate::ai::agent_sdk::retry::{
+    is_transient_http_error, BACKOFF_FACTOR, BACKOFF_JITTER, INITIAL_BACKOFF, MAX_ATTEMPTS,
+};
 use crate::server::server_api::ServerApi;
 
 use super::{Event, RequestParams, ResponseStream};
 use request::{
-    convert_inputs_to_task_messages, start_local_responses_eventsource, stream_error_to_anyhow,
+    convert_inputs_to_task_messages, open_local_responses_eventsource,
+    prepare_local_responses_request, stream_error_to_anyhow,
 };
 use stream::handle_responses_stream_message;
 use types::{LocalConversationState, StreamingResponsesAccumulator};
@@ -346,8 +354,8 @@ pub fn generate_local_openai_responses_output(
             }
         }
 
-        let mut response_stream = match start_local_responses_eventsource(&server_api, &params).await {
-            Ok(stream) => stream,
+        let prepared_request = match prepare_local_responses_request(&params) {
+            Ok(prepared_request) => prepared_request,
             Err(error) => {
                 log::warn!("Local OpenAI Responses backend failed before streaming began: {error:#}");
                 yield Ok(user_visible_error_event(
@@ -362,73 +370,173 @@ pub fn generate_local_openai_responses_output(
             }
         };
 
-        let mut accumulator = StreamingResponsesAccumulator::default();
         let mut cancellation_future = Box::pin(cancellation_rx);
         let mut stream_finished = false;
+        let mut retry_attempt = 1usize;
+        let mut retry_delay = INITIAL_BACKOFF;
 
-        loop {
-            let next_event_future = Box::pin(response_stream.next());
-            match select(next_event_future, cancellation_future).await {
-                Either::Left((next_event, next_cancellation_future)) => {
-                    cancellation_future = next_cancellation_future;
-                    let Some(next_event) = next_event else {
-                        break;
-                    };
-
-                    match next_event {
-                        Ok(EventSourceEvent::Open) => {}
-                        Ok(EventSourceEvent::Message(message)) => {
-                            match handle_responses_stream_message(
-                                &params,
-                                &task_id,
-                                &request_id,
-                                message.event.as_str(),
-                                message.data.as_str(),
-                                &mut accumulator,
-                            ) {
-                                Ok(result) => {
-                                    for event in result.events {
-                                        yield event;
-                                    }
-                                    if result.is_terminal {
-                                        stream_finished = true;
-                                        break;
-                                    }
-                                }
-                                Err(error) => {
-                                    log::warn!("Failed to translate local OpenAI Responses event: {error:#}");
-                                    yield Ok(user_visible_error_event(
-                                        &task_id,
-                                        &request_id,
-                                        &error.to_string(),
-                                    ));
-                                    yield Ok(stream_finished_event(
-                                        finished_reason_for_error(&error, params.model.to_string()),
-                                    ));
-                                    return;
-                                }
+        'retry: loop {
+            let mut has_emitted_provider_output = false;
+            let mut accumulator = StreamingResponsesAccumulator::default();
+            let mut response_stream = match open_local_responses_eventsource(&server_api, &prepared_request).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    if should_retry_local_backend_error(&error, retry_attempt, false) {
+                        log::warn!(
+                            "Local OpenAI Responses backend failed before streaming began on attempt {retry_attempt}/{MAX_ATTEMPTS}, retrying: {error:#}"
+                        );
+                        match wait_for_local_backend_retry_delay(cancellation_future, retry_delay).await {
+                            Ok(next_cancellation_future) => {
+                                cancellation_future = next_cancellation_future;
+                                retry_attempt += 1;
+                                retry_delay = retry_delay.mul_f32(BACKOFF_FACTOR);
+                                continue 'retry;
+                            }
+                            Err(()) => {
+                                log::info!("Local OpenAI Responses stream cancelled");
+                                return;
                             }
                         }
-                        Err(err) => {
-                            let error = stream_error_to_anyhow(err).await;
-                            log::warn!("Local OpenAI Responses stream failed: {error:#}");
-                            yield Ok(user_visible_error_event(
-                                &task_id,
-                                &request_id,
-                                &error.to_string(),
-                            ));
-                            yield Ok(stream_finished_event(
-                                finished_reason_for_error(&error, params.model.to_string()),
-                            ));
-                            return;
-                        }
                     }
-                }
-                Either::Right((_, _)) => {
-                    log::info!("Local OpenAI Responses stream cancelled");
+
+                    log::warn!("Local OpenAI Responses backend failed before streaming began: {error:#}");
+                    yield Ok(user_visible_error_event(
+                        &task_id,
+                        &request_id,
+                        &error.to_string(),
+                    ));
+                    yield Ok(stream_finished_event(
+                        finished_reason_for_error(&error, model_name),
+                    ));
                     return;
                 }
+            };
+
+            loop {
+                let next_event_future = Box::pin(response_stream.next());
+                match select(next_event_future, cancellation_future).await {
+                    Either::Left((next_event, next_cancellation_future)) => {
+                        cancellation_future = next_cancellation_future;
+                        let Some(next_event) = next_event else {
+                            break;
+                        };
+
+                        match next_event {
+                            Ok(EventSourceEvent::Open) => {}
+                            Ok(EventSourceEvent::Message(message)) => {
+                                match handle_responses_stream_message(
+                                    &params,
+                                    &task_id,
+                                    &request_id,
+                                    message.event.as_str(),
+                                    message.data.as_str(),
+                                    &mut accumulator,
+                                ) {
+                                    Ok(result) => {
+                                        if response_events_include_provider_output(message.event.as_str(), &result) {
+                                            has_emitted_provider_output = true;
+                                        }
+                                        for event in result.events {
+                                            yield event;
+                                        }
+                                        if result.is_terminal {
+                                            stream_finished = true;
+                                            break 'retry;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        if should_retry_local_backend_error(
+                                            &error,
+                                            retry_attempt,
+                                            has_emitted_provider_output,
+                                        ) {
+                                            log::warn!(
+                                                "Failed to translate local OpenAI Responses event on attempt {retry_attempt}/{MAX_ATTEMPTS}, retrying: {error:#}"
+                                            );
+                                            break;
+                                        }
+
+                                        log::warn!("Failed to translate local OpenAI Responses event: {error:#}");
+                                        yield Ok(user_visible_error_event(
+                                            &task_id,
+                                            &request_id,
+                                            &error.to_string(),
+                                        ));
+                                        yield Ok(stream_finished_event(
+                                            finished_reason_for_error(&error, params.model.to_string()),
+                                        ));
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                let error = stream_error_to_anyhow(err).await;
+                                if should_retry_local_backend_error(
+                                    &error,
+                                    retry_attempt,
+                                    has_emitted_provider_output,
+                                ) {
+                                    log::warn!(
+                                        "Local OpenAI Responses stream failed on attempt {retry_attempt}/{MAX_ATTEMPTS}, retrying: {error:#}"
+                                    );
+                                    break;
+                                }
+
+                                log::warn!("Local OpenAI Responses stream failed: {error:#}");
+                                yield Ok(user_visible_error_event(
+                                    &task_id,
+                                    &request_id,
+                                    &error.to_string(),
+                                ));
+                                yield Ok(stream_finished_event(
+                                    finished_reason_for_error(&error, params.model.to_string()),
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                    Either::Right((_, _)) => {
+                        log::info!("Local OpenAI Responses stream cancelled");
+                        return;
+                    }
+                }
             }
+
+            if stream_finished {
+                break;
+            }
+
+            let stream_end_error =
+                anyhow!("Local OpenAI Responses stream ended unexpectedly before a terminal event");
+            if should_retry_local_backend_error(
+                &stream_end_error,
+                retry_attempt,
+                has_emitted_provider_output,
+            ) {
+                log::warn!(
+                    "Local OpenAI Responses stream ended early on attempt {retry_attempt}/{MAX_ATTEMPTS}, retrying"
+                );
+                match wait_for_local_backend_retry_delay(cancellation_future, retry_delay).await {
+                    Ok(next_cancellation_future) => {
+                        cancellation_future = next_cancellation_future;
+                        retry_attempt += 1;
+                        retry_delay = retry_delay.mul_f32(BACKOFF_FACTOR);
+                        continue 'retry;
+                    }
+                    Err(()) => {
+                        log::info!("Local OpenAI Responses stream cancelled");
+                        return;
+                    }
+                }
+            }
+
+            log::debug!("Local OpenAI Responses stream ended without a terminal event");
+            yield Ok(stream_finished_event(
+                api::response_event::stream_finished::Reason::Done(
+                    api::response_event::stream_finished::Done {},
+                ),
+            ));
+            return;
         }
 
         if !stream_finished {
@@ -440,6 +548,64 @@ pub fn generate_local_openai_responses_output(
             ));
         }
     })
+}
+
+/// Returns whether a local backend failure should be retried on the current attempt.
+fn should_retry_local_backend_error(
+    error: &anyhow::Error,
+    attempt: usize,
+    has_emitted_provider_output: bool,
+) -> bool {
+    !has_emitted_provider_output
+        && attempt < MAX_ATTEMPTS
+        && is_retryable_local_backend_error(error)
+}
+
+/// Returns whether a local backend error is transient enough to retry safely.
+fn is_retryable_local_backend_error(error: &anyhow::Error) -> bool {
+    if let Some(provider_error) = error.downcast_ref::<ProviderError>() {
+        return matches!(provider_error.status_code, 408 | 429 | 500..=599);
+    }
+
+    is_transient_http_error(error)
+}
+
+/// Returns whether a translated stream message already produced provider-derived output.
+fn response_events_include_provider_output(
+    event_name: &str,
+    result: &types::StreamMessageResult,
+) -> bool {
+    if matches!(
+        event_name,
+        "response.output_text.delta"
+            | "response.text.delta"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary_text.done"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_text.done"
+            | "response.function_call_arguments.done"
+            | "response.output_item.done"
+    ) {
+        return !result.events.is_empty();
+    }
+
+    event_name == "response.completed" && result.events.len() > 1
+}
+
+/// Waits for the next retry backoff interval unless the request is cancelled first.
+async fn wait_for_local_backend_retry_delay(
+    cancellation_future: Pin<Box<oneshot::Receiver<()>>>,
+    delay: Duration,
+) -> Result<Pin<Box<oneshot::Receiver<()>>>, ()> {
+    match select(
+        Box::pin(Timer::after(duration_with_jitter(delay, BACKOFF_JITTER))),
+        cancellation_future,
+    )
+    .await
+    {
+        Either::Left((_, next_cancellation_future)) => Ok(next_cancellation_future),
+        Either::Right((_, _)) => Err(()),
+    }
 }
 
 /// Builds the initial stream event for a local backend request.

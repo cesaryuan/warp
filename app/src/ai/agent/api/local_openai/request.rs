@@ -15,18 +15,25 @@ use crate::server::server_api::ServerApi;
 
 use super::tool_schemas::built_in_tool_schema;
 use super::types::{
-    ParsedFunctionCall, ResponsesErrorEnvelope, ResponsesReasoningConfig, ResponsesRequestBody,
+    ParsedFunctionCall, ResponsesErrorEnvelope, ResponsesOutputItem, ResponsesReasoningConfig,
+    ResponsesRequestBody,
 };
 use super::{
     build_local_openai_system_prompt, conversation_state_store, ProviderError, RequestParams,
 };
 use crate::ai::agent::api::r#impl::get_supported_tools;
 
-/// Starts a local Responses event stream after recording the new request inputs in conversation state.
-pub(super) async fn start_local_responses_eventsource(
-    server_api: &ServerApi,
+/// Prepared request data that can be reused across bounded local backend retries.
+pub(super) struct PreparedLocalResponsesRequest {
+    pub(super) api_key: String,
+    pub(super) endpoint: String,
+    pub(super) request_body: ResponsesRequestBody,
+}
+
+/// Prepares a local Responses request after recording the new inputs in conversation state once.
+pub(super) fn prepare_local_responses_request(
     params: &RequestParams,
-) -> anyhow::Result<http_client::EventSourceStream> {
+) -> anyhow::Result<PreparedLocalResponsesRequest> {
     let api_key = params
         .local_openai_api_key
         .as_ref()
@@ -61,18 +68,38 @@ pub(super) async fn start_local_responses_eventsource(
             instructions: build_local_openai_system_prompt(&normalized_model),
             model: normalized_model,
             reasoning,
+            include: responses_include_fields(),
             input: state.items,
             tools: build_tools_payload(params),
             tool_choice: "auto",
+            parallel_tool_calls: true,
+            store: false,
             stream: true,
         }
     };
 
+    Ok(PreparedLocalResponsesRequest {
+        api_key,
+        endpoint,
+        request_body,
+    })
+}
+
+/// Returns the extra Responses fields Warp needs preserved across stateless turns.
+fn responses_include_fields() -> Vec<String> {
+    vec!["reasoning.encrypted_content".to_string()]
+}
+
+/// Opens a local Responses event stream from a prepared request payload.
+pub(super) async fn open_local_responses_eventsource(
+    server_api: &ServerApi,
+    prepared_request: &PreparedLocalResponsesRequest,
+) -> anyhow::Result<http_client::EventSourceStream> {
     Ok(server_api
         .http_client()
-        .post(endpoint)
-        .bearer_auth(api_key)
-        .json(&request_body)
+        .post(prepared_request.endpoint.clone())
+        .bearer_auth(prepared_request.api_key.clone())
+        .json(&prepared_request.request_body)
         .eventsource())
 }
 
@@ -399,6 +426,57 @@ pub(super) fn function_call_history_item(function_call: &ParsedFunctionCall) -> 
     })
 }
 
+/// Converts a reasoning output item into a replayable history item when encrypted context is present.
+pub(super) fn reasoning_history_item(item: &ResponsesOutputItem) -> Option<Value> {
+    let encrypted_content = item.encrypted_content.as_deref()?;
+    let mut history_item = serde_json::Map::new();
+    history_item.insert("type".to_string(), Value::String("reasoning".to_string()));
+    history_item.insert(
+        "encrypted_content".to_string(),
+        Value::String(encrypted_content.to_string()),
+    );
+
+    if let Some(id) = item.id.as_ref().filter(|id| !id.is_empty()) {
+        history_item.insert("id".to_string(), Value::String(id.clone()));
+    }
+
+    if !item.summary.is_empty() {
+        history_item.insert(
+            "summary".to_string(),
+            Value::Array(
+                item.summary
+                    .iter()
+                    .map(|part| {
+                        json!({
+                            "type": part.item_type,
+                            "text": part.text,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+
+    if !item.content.is_empty() {
+        history_item.insert(
+            "content".to_string(),
+            Value::Array(
+                item.content
+                    .iter()
+                    .map(|part| {
+                        json!({
+                            "type": part.item_type,
+                            "text": part.text,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+
+    Some(Value::Object(history_item))
+}
+
 /// Converts a completed tool result into a Responses `function_call_output` item.
 fn function_call_output_item(call_id: String, output: String) -> Value {
     json!({
@@ -516,6 +594,9 @@ pub(super) fn normalize_openai_model_and_reasoning(
 ) -> (String, Option<ResponsesReasoningConfig>) {
     let (base_model_id, reasoning) = split_openai_reasoning_suffix(model_id);
     if let Some(normalized_model) = normalize_openai_model_base(base_model_id) {
+        let reasoning = reasoning
+            .map(enable_reasoning_summary)
+            .or_else(|| build_reasoning_summary_config(&normalized_model));
         return (normalized_model, reasoning);
     }
 
@@ -531,12 +612,34 @@ fn split_openai_reasoning_suffix(model_id: &str) -> (&str, Option<ResponsesReaso
         return (
             base_model_id,
             Some(ResponsesReasoningConfig {
-                effort: effort.to_string(),
+                effort: Some(effort.to_string()),
+                summary: None,
             }),
         );
     }
 
     (model_id, None)
+}
+
+/// Enables reasoning summaries on a Responses reasoning config so Warp can render thinking blocks.
+fn enable_reasoning_summary(mut reasoning: ResponsesReasoningConfig) -> ResponsesReasoningConfig {
+    reasoning.summary = Some("auto".to_string());
+    reasoning
+}
+
+/// Builds a summary-only reasoning config for supported OpenAI reasoning models.
+fn build_reasoning_summary_config(model_id: &str) -> Option<ResponsesReasoningConfig> {
+    should_request_reasoning_summary(model_id).then(|| ResponsesReasoningConfig {
+        effort: None,
+        summary: Some("auto".to_string()),
+    })
+}
+
+/// Returns whether Warp should opt into reasoning summaries for the given normalized model.
+fn should_request_reasoning_summary(model_id: &str) -> bool {
+    model_id.starts_with("gpt-5")
+        || model_id.starts_with("gpt-oss")
+        || matches!(model_id.split('-').next(), Some("o1" | "o3" | "o4"))
 }
 
 /// Normalizes the base model ID into the exact Responses API model name when we recognize it.
