@@ -5,8 +5,8 @@ use ai::agent::action_result::{AIAgentActionResultType, ReadFilesResult};
 use warp_multi_agent_api as api;
 
 use super::request::{
-    build_tools_payload, convert_inputs_to_response_items, mcp_tool_schema,
-    normalize_openai_model_and_reasoning, normalize_responses_endpoint,
+    build_tools_payload, convert_inputs_to_response_items, convert_inputs_to_task_messages,
+    mcp_tool_schema, normalize_openai_model_and_reasoning, normalize_responses_endpoint,
     task_history_response_items,
 };
 use super::stream::{
@@ -598,6 +598,48 @@ fn convert_inputs_to_response_items_supports_user_query_and_action_result() {
     assert_eq!(items[1]["type"], "function_call_output");
 }
 
+/// Verifies that local request inputs are mirrored into persisted task messages for restore.
+#[test]
+fn convert_inputs_to_task_messages_supports_user_query_and_action_result() {
+    let task_id = TaskId::new("task".to_string());
+    let request_id = "request-123";
+    let inputs = vec![
+        AIAgentInput::UserQuery {
+            query: "hello".to_string(),
+            context: std::sync::Arc::new([AIAgentContext::SelectedText("world".to_string())]),
+            static_query_type: None,
+            referenced_attachments: std::collections::HashMap::new(),
+            user_query_mode: crate::ai::agent::UserQueryMode::Normal,
+            running_command: None,
+            intended_agent: None,
+        },
+        AIAgentInput::ActionResult {
+            result: AIAgentActionResult {
+                id: "call_123".to_string().into(),
+                task_id: task_id.clone(),
+                result: AIAgentActionResultType::ReadFiles(ReadFilesResult::Error(
+                    "missing".to_string(),
+                )),
+            },
+            context: std::sync::Arc::new([]),
+        },
+    ];
+
+    let messages = convert_inputs_to_task_messages(&inputs, &task_id, request_id)
+        .expect("inputs should convert into task messages");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].task_id, task_id.to_string());
+    assert_eq!(messages[0].request_id, request_id);
+    assert!(matches!(
+        messages[0].message,
+        Some(api::message::Message::UserQuery(_))
+    ));
+    assert!(matches!(
+        messages[1].message,
+        Some(api::message::Message::ToolCallResult(_))
+    ));
+}
+
 /// Verifies that persisted task history seeds local Responses input items for conversation resumes.
 #[test]
 fn task_history_response_items_restore_prior_messages() {
@@ -616,15 +658,13 @@ fn task_history_response_items_restore_prior_messages() {
                 citations: vec![],
                 request_id: "request-1".to_string(),
                 timestamp: None,
-                message: Some(api::message::Message::UserQuery(
-                    api::message::UserQuery {
-                        query: "prior question".to_string(),
-                        context: None,
-                        referenced_attachments: std::collections::HashMap::new(),
-                        mode: None,
-                        intended_agent: Default::default(),
-                    },
-                )),
+                message: Some(api::message::Message::UserQuery(api::message::UserQuery {
+                    query: "prior question".to_string(),
+                    context: None,
+                    referenced_attachments: std::collections::HashMap::new(),
+                    mode: None,
+                    intended_agent: Default::default(),
+                })),
             },
             api::Message {
                 id: "message-tool".to_string(),
@@ -656,17 +696,15 @@ fn task_history_response_items_restore_prior_messages() {
                     api::message::ToolCallResult {
                         tool_call_id: "call_1".to_string(),
                         context: None,
-                        result: Some(
-                            api::message::tool_call_result::Result::ReadFiles(
-                                api::ReadFilesResult {
-                                    result: Some(api::read_files_result::Result::Error(
-                                        api::read_files_result::Error {
-                                            message: "missing".to_string(),
-                                        },
-                                    )),
-                                },
-                            ),
-                        ),
+                        result: Some(api::message::tool_call_result::Result::ReadFiles(
+                            api::ReadFilesResult {
+                                result: Some(api::read_files_result::Result::Error(
+                                    api::read_files_result::Error {
+                                        message: "missing".to_string(),
+                                    },
+                                )),
+                            },
+                        )),
                     },
                 )),
             },

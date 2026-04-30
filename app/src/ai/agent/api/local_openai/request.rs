@@ -4,11 +4,13 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::anyhow;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use prost::Message as _;
 use serde_json::{json, Value};
+use uuid::Uuid;
 use warp_multi_agent_api as api;
 
+use crate::ai::agent::api::{convert_to::convert_input, user_inputs_from_messages};
 use crate::ai::agent::{AIAgentContext, AIAgentInput, MCPContext, MCPServer};
-use crate::ai::agent::api::user_inputs_from_messages;
 use crate::server::server_api::ServerApi;
 
 use super::tool_schemas::built_in_tool_schema;
@@ -138,6 +140,97 @@ pub(super) fn convert_inputs_to_response_items(
         }
     }
     Ok(items)
+}
+
+/// Converts request inputs into synthetic task messages so local conversations survive restore.
+pub(super) fn convert_inputs_to_task_messages(
+    inputs: &[AIAgentInput],
+    task_id: &crate::ai::agent::task::TaskId,
+    request_id: &str,
+) -> anyhow::Result<Vec<api::Message>> {
+    inputs
+        .iter()
+        .cloned()
+        .map(|input| convert_input_to_task_message(input, task_id, request_id))
+        .collect()
+}
+
+/// Converts one persisted local request input into the matching task message representation.
+fn convert_input_to_task_message(
+    input: AIAgentInput,
+    task_id: &crate::ai::agent::task::TaskId,
+    request_id: &str,
+) -> anyhow::Result<api::Message> {
+    let converted_input = convert_input(vec![input]).map_err(|error| {
+        anyhow!("Failed to convert local request input into task message: {error}")
+    })?;
+    let context = converted_input.context;
+    let Some(api::request::input::Type::UserInputs(user_inputs)) = converted_input.r#type else {
+        return Err(anyhow!(
+            "Local request input did not convert into user_inputs for task persistence"
+        ));
+    };
+    let Some(user_input) = user_inputs
+        .inputs
+        .into_iter()
+        .next()
+        .and_then(|input| input.input)
+    else {
+        return Err(anyhow!(
+            "Local request input converted into an empty user_inputs payload"
+        ));
+    };
+
+    let message = match user_input {
+        api::request::input::user_inputs::user_input::Input::UserQuery(user_query) => {
+            api::message::Message::UserQuery(api::message::UserQuery {
+                query: user_query.query,
+                context,
+                referenced_attachments: user_query.referenced_attachments,
+                mode: user_query.mode,
+                intended_agent: user_query.intended_agent,
+            })
+        }
+        api::request::input::user_inputs::user_input::Input::ToolCallResult(tool_call_result) => {
+            api::message::Message::ToolCallResult(request_tool_call_result_to_message(
+                tool_call_result,
+                context,
+            )?)
+        }
+        unsupported => {
+            return Err(anyhow!(
+                "Local request input converted into unsupported persisted input variant: {:?}",
+                unsupported
+            ));
+        }
+    };
+
+    Ok(api::Message {
+        id: Uuid::new_v4().to_string(),
+        task_id: task_id.to_string(),
+        server_message_data: String::new(),
+        citations: vec![],
+        message: Some(message),
+        request_id: request_id.to_string(),
+        timestamp: None,
+    })
+}
+
+/// Transcodes a request-side tool-call result into the persisted task-message shape.
+fn request_tool_call_result_to_message(
+    tool_call_result: api::request::input::ToolCallResult,
+    context: Option<api::InputContext>,
+) -> anyhow::Result<api::message::ToolCallResult> {
+    // These protobuf messages intentionally share the same wire shape for `tool_call_id`
+    // and `result`, so we can transcode instead of hand-mapping every result variant.
+    let mut message_tool_call_result = api::message::ToolCallResult::decode(
+        tool_call_result.encode_to_vec().as_slice(),
+    )
+    .map_err(|error| {
+        anyhow!("Failed to transcode request tool_call_result into persisted task message: {error}")
+    })?;
+    message_tool_call_result.context = context;
+    Ok(message_tool_call_result)
 }
 
 /// Creates a user message item including serialized Warp-specific context.
@@ -704,10 +797,9 @@ fn serialize_api_tool_call(
                 "conversation_id": fetch.conversation_id,
             }),
         )),
-        api::message::tool_call::Tool::ReadSkill(read_skill) => Some((
-            "read_skill".to_string(),
-            serialize_read_skill(read_skill),
-        )),
+        api::message::tool_call::Tool::ReadSkill(read_skill) => {
+            Some(("read_skill".to_string(), serialize_read_skill(read_skill)))
+        }
         _ => None,
     };
 
@@ -781,9 +873,7 @@ fn serialize_v4a_hunk(
 }
 
 /// Converts a read-documents request entry into the local JSON format.
-fn serialize_read_document(
-    document: &api::message::tool_call::read_documents::Document,
-) -> Value {
+fn serialize_read_document(document: &api::message::tool_call::read_documents::Document) -> Value {
     json!({
         "document_id": document.document_id,
         "line_ranges": document.line_ranges.iter().map(serialize_line_range).collect::<Vec<_>>(),
@@ -791,9 +881,7 @@ fn serialize_read_document(
 }
 
 /// Converts an edit-documents diff into the local JSON format.
-fn serialize_document_diff(
-    diff: &api::message::tool_call::edit_documents::DocumentDiff,
-) -> Value {
+fn serialize_document_diff(diff: &api::message::tool_call::edit_documents::DocumentDiff) -> Value {
     json!({
         "document_id": diff.document_id,
         "search": diff.search,
@@ -894,7 +982,8 @@ fn prost_value_to_json(value: &prost_types::Value) -> anyhow::Result<Value> {
         Kind::StringValue(value) => Value::String(value.clone()),
         Kind::StructValue(value) => prost_struct_to_json(value)?,
         Kind::ListValue(value) => Value::Array(
-            value.values
+            value
+                .values
                 .iter()
                 .map(prost_value_to_json)
                 .collect::<anyhow::Result<Vec<_>>>()?,
