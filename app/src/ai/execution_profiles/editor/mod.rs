@@ -5,8 +5,8 @@ use crate::ai::execution_profiles::{
     AIExecutionProfile, ActionPermission, WriteToPtyPermission,
 };
 use crate::ai::llms::{
-    effective_disable_reason_for_model, DisableReason, LLMContextWindow, LLMId, LLMInfo, LLMPreferences,
-    LLMPreferencesEvent,
+    effective_disable_reason_for_model, DisableReason, LLMContextWindow, LLMId, LLMInfo,
+    LLMPreferences, LLMPreferencesEvent,
 };
 use crate::ai::paths::host_native_absolute_path;
 use crate::editor::InteractionState;

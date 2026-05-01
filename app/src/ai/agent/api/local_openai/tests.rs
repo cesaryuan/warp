@@ -418,6 +418,74 @@ fn prepare_local_responses_request_configures_parallel_tool_calls_and_store_poli
         request_body["include"],
         serde_json::json!(["reasoning.encrypted_content"])
     );
+    assert!(request_body["prompt_cache_key"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("warp-local-openai:")));
+}
+
+/// Verifies that prompt cache keys stay stable across per-turn input changes within the same conversation.
+#[test]
+fn prepare_local_responses_request_keeps_prompt_cache_key_stable_for_same_conversation() {
+    let conversation_id = AIConversationId::new();
+    let mut params_a = request_params_for_local_backend_tests();
+    params_a.conversation_id = conversation_id;
+    params_a.local_openai_api_key = Some("test-key".to_string());
+    params_a.local_openai_base_url = Some("https://example.com".to_string());
+    params_a.input = vec![AIAgentInput::UserQuery {
+        query: "first question".to_string(),
+        context: std::sync::Arc::new([]),
+        static_query_type: None,
+        referenced_attachments: std::collections::HashMap::new(),
+        user_query_mode: crate::ai::agent::UserQueryMode::Normal,
+        running_command: None,
+        intended_agent: None,
+    }];
+
+    let mut params_b = request_params_for_local_backend_tests();
+    params_b.conversation_id = conversation_id;
+    params_b.local_openai_api_key = Some("test-key".to_string());
+    params_b.local_openai_base_url = Some("https://example.com".to_string());
+    params_b.input = vec![AIAgentInput::UserQuery {
+        query: "second question".to_string(),
+        context: std::sync::Arc::new([]),
+        static_query_type: None,
+        referenced_attachments: std::collections::HashMap::new(),
+        user_query_mode: crate::ai::agent::UserQueryMode::Normal,
+        running_command: None,
+        intended_agent: None,
+    }];
+
+    let prepared_a =
+        prepare_local_responses_request(&params_a).expect("first request should prepare");
+    let prepared_b =
+        prepare_local_responses_request(&params_b).expect("second request should prepare");
+
+    assert_eq!(
+        prepared_a.request_body.prompt_cache_key,
+        prepared_b.request_body.prompt_cache_key
+    );
+}
+
+/// Verifies that prompt cache keys change when Warp assigns a different conversation identity.
+#[test]
+fn prepare_local_responses_request_changes_prompt_cache_key_when_conversation_changes() {
+    let mut params_a = request_params_for_local_backend_tests();
+    params_a.local_openai_api_key = Some("test-key".to_string());
+    params_a.local_openai_base_url = Some("https://example.com".to_string());
+
+    let mut params_b = request_params_for_local_backend_tests();
+    params_b.local_openai_api_key = Some("test-key".to_string());
+    params_b.local_openai_base_url = Some("https://example.com".to_string());
+
+    let prepared_a =
+        prepare_local_responses_request(&params_a).expect("first request should prepare");
+    let prepared_b =
+        prepare_local_responses_request(&params_b).expect("second request should prepare");
+
+    assert_ne!(
+        prepared_a.request_body.prompt_cache_key,
+        prepared_b.request_body.prompt_cache_key
+    );
 }
 
 /// Verifies that streaming text deltas update the existing agent output field.

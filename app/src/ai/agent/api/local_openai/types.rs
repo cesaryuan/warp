@@ -89,6 +89,8 @@ pub(super) struct ResponsesRequestBody {
     pub(super) model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) reasoning: Option<ResponsesReasoningConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) include: Vec<String>,
     pub(super) instructions: String,

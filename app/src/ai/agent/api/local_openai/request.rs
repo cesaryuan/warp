@@ -64,13 +64,18 @@ pub(super) fn prepare_local_responses_request(
             .unwrap_or_default();
         let (normalized_model, reasoning) =
             normalize_openai_model_and_reasoning(&params.model.to_string());
+        let instructions = build_local_openai_system_prompt(&normalized_model);
+        let tools = build_tools_payload(params);
+        let include = responses_include_fields();
+        let prompt_cache_key = build_prompt_cache_key(params);
         ResponsesRequestBody {
-            instructions: build_local_openai_system_prompt(&normalized_model),
+            instructions,
             model: normalized_model,
             reasoning,
-            include: responses_include_fields(),
+            prompt_cache_key,
+            include,
             input: state.items,
-            tools: build_tools_payload(params),
+            tools,
             tool_choice: "auto",
             parallel_tool_calls: true,
             store: false,
@@ -88,6 +93,11 @@ pub(super) fn prepare_local_responses_request(
 /// Returns the extra Responses fields Warp needs preserved across stateless turns.
 fn responses_include_fields() -> Vec<String> {
     vec!["reasoning.encrypted_content".to_string()]
+}
+
+/// Builds a stable prompt cache key from Warp's conversation identity so repeated turns reuse the same cache route.
+fn build_prompt_cache_key(params: &RequestParams) -> Option<String> {
+    Some(format!("warp-local-openai:{}", params.conversation_id))
 }
 
 /// Opens a local Responses event stream from a prepared request payload.
