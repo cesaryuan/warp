@@ -422,6 +422,10 @@ fn prepare_local_responses_request_configures_parallel_tool_calls_and_store_poli
         request_body["prompt_cache_key"],
         serde_json::json!(params.conversation_id.to_string())
     );
+    assert_eq!(
+        prepared_request.session_id_header,
+        Some(params.conversation_id.to_string())
+    );
 }
 
 /// Verifies that prompt cache keys stay stable across per-turn input changes within the same conversation.
@@ -465,6 +469,7 @@ fn prepare_local_responses_request_keeps_prompt_cache_key_stable_for_same_conver
         prepared_a.request_body.prompt_cache_key,
         prepared_b.request_body.prompt_cache_key
     );
+    assert_eq!(prepared_a.session_id_header, prepared_b.session_id_header);
 }
 
 /// Verifies that prompt cache keys change when Warp assigns a different conversation identity.
@@ -486,6 +491,23 @@ fn prepare_local_responses_request_changes_prompt_cache_key_when_conversation_ch
     assert_ne!(
         prepared_a.request_body.prompt_cache_key,
         prepared_b.request_body.prompt_cache_key
+    );
+    assert_ne!(prepared_a.session_id_header, prepared_b.session_id_header);
+}
+
+/// Verifies that the Session_id request header mirrors the prompt cache key exactly.
+#[test]
+fn prepare_local_responses_request_sets_session_id_header_from_prompt_cache_key() {
+    let mut params = request_params_for_local_backend_tests();
+    params.local_openai_api_key = Some("test-key".to_string());
+    params.local_openai_base_url = Some("https://example.com".to_string());
+
+    let prepared_request =
+        prepare_local_responses_request(&params).expect("request should prepare successfully");
+
+    assert_eq!(
+        prepared_request.session_id_header,
+        prepared_request.request_body.prompt_cache_key
     );
 }
 

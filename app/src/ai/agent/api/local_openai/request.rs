@@ -28,6 +28,7 @@ pub(super) struct PreparedLocalResponsesRequest {
     pub(super) api_key: String,
     pub(super) endpoint: String,
     pub(super) request_body: ResponsesRequestBody,
+    pub(super) session_id_header: Option<String>,
 }
 
 /// Prepares a local Responses request after recording the new inputs in conversation state once.
@@ -82,11 +83,13 @@ pub(super) fn prepare_local_responses_request(
             stream: true,
         }
     };
+    let session_id_header = build_session_id_header(request_body.prompt_cache_key.as_deref());
 
     Ok(PreparedLocalResponsesRequest {
         api_key,
         endpoint,
         request_body,
+        session_id_header,
     })
 }
 
@@ -100,17 +103,24 @@ fn build_prompt_cache_key(params: &RequestParams) -> Option<String> {
     Some(params.conversation_id.to_string())
 }
 
+/// Mirrors the prompt cache key into the provider-specific session header value.
+fn build_session_id_header(prompt_cache_key: Option<&str>) -> Option<String> {
+    prompt_cache_key.map(ToOwned::to_owned)
+}
+
 /// Opens a local Responses event stream from a prepared request payload.
 pub(super) async fn open_local_responses_eventsource(
     server_api: &ServerApi,
     prepared_request: &PreparedLocalResponsesRequest,
 ) -> anyhow::Result<http_client::EventSourceStream> {
-    Ok(server_api
+    let mut request = server_api
         .http_client()
         .post(prepared_request.endpoint.clone())
-        .bearer_auth(prepared_request.api_key.clone())
-        .json(&prepared_request.request_body)
-        .eventsource())
+        .bearer_auth(prepared_request.api_key.clone());
+    if let Some(session_id) = prepared_request.session_id_header.as_deref() {
+        request = request.header("Session_id", session_id);
+    }
+    Ok(request.json(&prepared_request.request_body).eventsource())
 }
 
 /// Converts an SSE stream error into the closest local backend error shape we can expose.
