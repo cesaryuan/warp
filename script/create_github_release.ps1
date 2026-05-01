@@ -61,15 +61,6 @@ function Invoke-External {
     }
 }
 
-function Test-RemoteTagExists {
-    param([Parameter(Mandatory = $true)][string]$ReleaseTag)
-
-    $output = Invoke-ExternalCapture -FilePath 'git' -Arguments @(
-        'ls-remote', '--tags', 'origin', "refs/tags/$ReleaseTag"
-    )
-    return -not [string]::IsNullOrWhiteSpace($output)
-}
-
 function Test-LocalTagExists {
     param([Parameter(Mandatory = $true)][string]$ReleaseTag)
 
@@ -116,7 +107,11 @@ function Get-CommitSha {
 }
 
 function New-ReleaseTag {
-    param([Parameter(Mandatory = $true)][string]$ReleaseChannel)
+    param(
+        [Parameter(Mandatory = $true)][string]$ReleaseChannel,
+        [string]$GitHubRepo = '',
+        [switch]$SkipRemoteCheck = $false
+    )
 
     $dateFormatted = Get-Date -Format 'yyyy.MM.dd.HH.mm'
     $baseTag = "v0.$dateFormatted.$ReleaseChannel"
@@ -124,7 +119,13 @@ function New-ReleaseTag {
 
     while ($true) {
         $candidate = '{0}_{1:d2}' -f $baseTag, $suffix
-        if (-not (Test-LocalTagExists -ReleaseTag $candidate) -and -not (Test-RemoteTagExists -ReleaseTag $candidate)) {
+        $existsLocally = Test-LocalTagExists -ReleaseTag $candidate
+        $existsRemotely = $false
+        if (-not $SkipRemoteCheck -and -not [string]::IsNullOrWhiteSpace($GitHubRepo)) {
+            $existsRemotely = Test-RemoteTagExists -ReleaseTag $candidate -GitHubRepo $GitHubRepo
+        }
+
+        if (-not $existsLocally -and -not $existsRemotely) {
             return $candidate
         }
 
@@ -269,6 +270,46 @@ function Test-ReleaseExists {
     return $LASTEXITCODE -eq 0
 }
 
+function Test-RemoteTagExists {
+    param(
+        [Parameter(Mandatory = $true)][string]$ReleaseTag,
+        [Parameter(Mandatory = $true)][string]$GitHubRepo
+    )
+
+    & gh api "repos/$GitHubRepo/git/ref/tags/$ReleaseTag" *> $null
+    return $LASTEXITCODE -eq 0
+}
+
+function Get-RemoteTagCommitSha {
+    param(
+        [Parameter(Mandatory = $true)][string]$ReleaseTag,
+        [Parameter(Mandatory = $true)][string]$GitHubRepo
+    )
+
+    if (-not (Test-RemoteTagExists -ReleaseTag $ReleaseTag -GitHubRepo $GitHubRepo)) {
+        return ''
+    }
+
+    $type = Invoke-ExternalCapture -FilePath 'gh' -Arguments @(
+        'api', "repos/$GitHubRepo/git/ref/tags/$ReleaseTag", '--jq', '.object.type'
+    )
+    $sha = Invoke-ExternalCapture -FilePath 'gh' -Arguments @(
+        'api', "repos/$GitHubRepo/git/ref/tags/$ReleaseTag", '--jq', '.object.sha'
+    )
+
+    if ($type -eq 'commit') {
+        return $sha.Trim()
+    }
+
+    if ($type -eq 'tag') {
+        return (Invoke-ExternalCapture -FilePath 'gh' -Arguments @(
+            'api', "repos/$GitHubRepo/git/tags/$sha", '--jq', '.object.sha'
+        )).Trim()
+    }
+
+    return ''
+}
+
 function Find-ExistingReleaseTagForCommit {
     param(
         [Parameter(Mandatory = $true)][string]$CommitSha,
@@ -276,15 +317,15 @@ function Find-ExistingReleaseTagForCommit {
         [Parameter(Mandatory = $true)][string]$GitHubRepo
     )
 
-    $tagOutput = Invoke-ExternalCapture -FilePath 'git' -Arguments @(
-        'tag', '--points-at', $CommitSha, '--sort=-version:refname'
+    $releaseTagOutput = Invoke-ExternalCapture -FilePath 'gh' -Arguments @(
+        'release', 'list', '--repo', $GitHubRepo, '--limit', '100', '--json', 'tagName', '--jq', '.[].tagName'
     )
-    if ([string]::IsNullOrWhiteSpace($tagOutput)) {
+    if ([string]::IsNullOrWhiteSpace($releaseTagOutput)) {
         return ''
     }
 
     $channelPattern = '\.{0}_[0-9][0-9]$' -f [System.Text.RegularExpressions.Regex]::Escape($ReleaseChannel)
-    foreach ($candidate in ($tagOutput -split "`r?`n")) {
+    foreach ($candidate in ($releaseTagOutput -split "`r?`n")) {
         if ([string]::IsNullOrWhiteSpace($candidate)) {
             continue
         }
@@ -293,7 +334,8 @@ function Find-ExistingReleaseTagForCommit {
             continue
         }
 
-        if (Test-ReleaseExists -ReleaseTag $candidate -GitHubRepo $GitHubRepo) {
+        $candidateCommitSha = Get-RemoteTagCommitSha -ReleaseTag $candidate -GitHubRepo $GitHubRepo
+        if ($candidateCommitSha -eq $CommitSha) {
             return $candidate
         }
     }
@@ -354,7 +396,7 @@ $reusedExistingRelease = $false
 $targetCommitSha = Get-CommitSha -Ref $ToRef
 
 if ([string]::IsNullOrWhiteSpace($Tag)) {
-    $Tag = New-ReleaseTag -ReleaseChannel $Channel
+    $Tag = New-ReleaseTag -ReleaseChannel $Channel -SkipRemoteCheck
 }
 
 $effectiveBaseRef = Resolve-BaseRef -ExplicitBaseRef $BaseRef -TargetTag $Tag -TargetRef $ToRef
@@ -385,7 +427,6 @@ if ($DryRun) {
 Assert-CommandExists -Name 'gh'
 
 Invoke-External -FilePath 'gh' -Arguments @('auth', 'status')
-Invoke-External -FilePath 'git' -Arguments @('fetch', '--tags', 'origin')
 
 $existingReleaseTag = Find-ExistingReleaseTagForCommit -CommitSha $targetCommitSha -ReleaseChannel $Channel -GitHubRepo $gitHubRepo
 if (-not [string]::IsNullOrWhiteSpace($existingReleaseTag) -and $existingReleaseTag -ne $Tag) {
@@ -397,21 +438,22 @@ if (-not [string]::IsNullOrWhiteSpace($existingReleaseTag) -and $existingRelease
     $resolvedNotesPath = Get-NotesFilePath -ExplicitPath $NotesPath -ReleaseTag $Tag
     Set-Content -LiteralPath $resolvedNotesPath -Value $notesBody -Encoding utf8
     $title = "$releaseBaseName $Tag"
+} elseif (-not $reusedExistingRelease -and -not (Test-ReleaseExists -ReleaseTag $Tag -GitHubRepo $gitHubRepo) -and -not $PSBoundParameters.ContainsKey('Tag')) {
+    $Tag = New-ReleaseTag -ReleaseChannel $Channel -GitHubRepo $gitHubRepo
+    $effectiveBaseRef = Resolve-BaseRef -ExplicitBaseRef $BaseRef -TargetTag $Tag -TargetRef $ToRef
+    $commitSubjects = Get-CommitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef -CommitAuthorPattern $AuthorPattern
+    $notesBody = Build-ReleaseNotes -Subjects $commitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef
+    $resolvedNotesPath = Get-NotesFilePath -ExplicitPath $NotesPath -ReleaseTag $Tag
+    Set-Content -LiteralPath $resolvedNotesPath -Value $notesBody -Encoding utf8
+    $title = "$releaseBaseName $Tag"
 }
 
 Write-Output "Using release tag: $Tag"
 Write-Output "Reused existing release: $reusedExistingRelease"
 
-if (-not (Test-LocalTagExists -ReleaseTag $Tag) -and -not (Test-RemoteTagExists -ReleaseTag $Tag)) {
-    Invoke-External -FilePath 'git' -Arguments @('tag', $Tag, $ToRef)
-    Invoke-External -FilePath 'git' -Arguments @('push', 'origin', $Tag)
-} elseif ((Test-LocalTagExists -ReleaseTag $Tag) -and -not (Test-RemoteTagExists -ReleaseTag $Tag)) {
-    Invoke-External -FilePath 'git' -Arguments @('push', 'origin', $Tag)
-}
-
 if (Test-ReleaseExists -ReleaseTag $Tag -GitHubRepo $gitHubRepo) {
     $existingBody = Get-ReleaseBody -ReleaseTag $Tag -GitHubRepo $gitHubRepo
-    $existingReleasePointsToTarget = (Get-CommitSha -Ref $Tag) -eq $targetCommitSha
+    $existingReleasePointsToTarget = (Get-RemoteTagCommitSha -ReleaseTag $Tag -GitHubRepo $gitHubRepo) -eq $targetCommitSha
     $preserveExistingNotes = Test-ShouldPreserveExistingNotes -ExistingBody $existingBody -GeneratedBody $notesBody -DefaultBody $defaultReleaseBody
 
     if (-not $existingReleasePointsToTarget -or -not $preserveExistingNotes) {
@@ -440,7 +482,8 @@ if (Test-ReleaseExists -ReleaseTag $Tag -GitHubRepo $gitHubRepo) {
         'release', 'create', $Tag, $resolvedAssetPath,
         '--repo', $gitHubRepo,
         '--title', $title,
-        '--notes-file', $resolvedNotesPath
+        '--notes-file', $resolvedNotesPath,
+        '--target', $targetCommitSha
     )
     if ($Draft) {
         $createArguments += '--draft'
