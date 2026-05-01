@@ -1208,7 +1208,7 @@ define_settings_group!(AISettings, settings: [
     // Responses API endpoint directly for Warp Agent requests.
     local_openai_responses_backend_enabled: LocalOpenAIResponsesBackendEnabled {
         type: bool,
-        default: false,
+        default: true,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Never,
         private: false,

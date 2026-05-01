@@ -5,6 +5,7 @@ use warpui::{Entity, ModelContext, SingletonEntity};
 use warpui_extras::secure_storage::{self, AppContextExt};
 
 const SECURE_STORAGE_KEY: &str = "AiApiKeys";
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
 
 /// Emitted when user-provided API keys are updated in-memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,17 +13,35 @@ pub enum ApiKeyManagerEvent {
     KeysUpdated,
 }
 
+/// Returns the default OpenAI-compatible base URL for local Responses requests.
+fn default_openai_base_url() -> Option<String> {
+    Some(DEFAULT_OPENAI_BASE_URL.to_string())
+}
+
 /// User-provided API keys for AI providers.
 ///
 /// These are used for "Bring Your Own API Key" functionality, allowing
 /// users to use their own API keys instead of Warp's.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiKeys {
     pub google: Option<String>,
     pub anthropic: Option<String>,
     pub openai: Option<String>,
+    #[serde(default = "default_openai_base_url")]
     pub openai_base_url: Option<String>,
     pub open_router: Option<String>,
+}
+
+impl Default for ApiKeys {
+    fn default() -> Self {
+        Self {
+            google: None,
+            anthropic: None,
+            openai: None,
+            openai_base_url: default_openai_base_url(),
+            open_router: None,
+        }
+    }
 }
 
 impl ApiKeys {
@@ -217,6 +236,41 @@ impl ApiKeyManager {
         if let Err(e) = ctx.secure_storage().write_value(SECURE_STORAGE_KEY, &json) {
             log::error!("Failed to write API keys to secure storage: {e:#}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApiKeys, DEFAULT_OPENAI_BASE_URL};
+
+    /// Verifies new API key state starts with the official OpenAI base URL.
+    #[test]
+    fn api_keys_default_to_official_openai_base_url() {
+        let keys = ApiKeys::default();
+
+        assert_eq!(
+            keys.openai_base_url.as_deref(),
+            Some(DEFAULT_OPENAI_BASE_URL)
+        );
+    }
+
+    /// Verifies older stored payloads without the base URL field pick up the new default.
+    #[test]
+    fn api_keys_deserialize_missing_base_url_to_official_openai_url() {
+        let keys: ApiKeys = serde_json::from_str(
+            r#"{
+                "google": null,
+                "anthropic": null,
+                "openai": "sk-test",
+                "open_router": null
+            }"#,
+        )
+        .expect("api keys JSON should deserialize");
+
+        assert_eq!(
+            keys.openai_base_url.as_deref(),
+            Some(DEFAULT_OPENAI_BASE_URL)
+        );
     }
 }
 
