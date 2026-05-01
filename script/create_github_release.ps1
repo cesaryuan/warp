@@ -270,6 +270,16 @@ function Test-ReleaseExists {
     return $LASTEXITCODE -eq 0
 }
 
+function Test-RemoteCommitExists {
+    param(
+        [Parameter(Mandatory = $true)][string]$CommitSha,
+        [Parameter(Mandatory = $true)][string]$GitHubRepo
+    )
+
+    & gh api "repos/$GitHubRepo/commits/$CommitSha" *> $null
+    return $LASTEXITCODE -eq 0
+}
+
 function Test-RemoteTagExists {
     param(
         [Parameter(Mandatory = $true)][string]$ReleaseTag,
@@ -352,6 +362,26 @@ function Get-ReleaseBody {
     return Invoke-ExternalCapture -FilePath 'gh' -Arguments @(
         'release', 'view', $ReleaseTag, '--repo', $GitHubRepo, '--json', 'body', '--jq', '.body // ""'
     )
+}
+
+function Cleanup-CreatedTag {
+    param(
+        [Parameter(Mandatory = $true)][string]$ReleaseTag,
+        [Parameter(Mandatory = $true)][string]$GitHubRepo
+    )
+
+    if (Test-ReleaseExists -ReleaseTag $ReleaseTag -GitHubRepo $GitHubRepo) {
+        Invoke-External -FilePath 'gh' -Arguments @(
+            'release', 'delete', $ReleaseTag, '--repo', $GitHubRepo, '--yes', '--cleanup-tag'
+        )
+        return
+    }
+
+    if (Test-RemoteTagExists -ReleaseTag $ReleaseTag -GitHubRepo $GitHubRepo) {
+        Invoke-External -FilePath 'gh' -Arguments @(
+            'api', '--method', 'DELETE', "repos/$GitHubRepo/git/refs/tags/$ReleaseTag"
+        )
+    }
 }
 
 function Test-ShouldPreserveExistingNotes {
@@ -451,47 +481,63 @@ if (-not [string]::IsNullOrWhiteSpace($existingReleaseTag) -and $existingRelease
 Write-Output "Using release tag: $Tag"
 Write-Output "Reused existing release: $reusedExistingRelease"
 
-if (Test-ReleaseExists -ReleaseTag $Tag -GitHubRepo $gitHubRepo) {
-    $existingBody = Get-ReleaseBody -ReleaseTag $Tag -GitHubRepo $gitHubRepo
-    $existingReleasePointsToTarget = (Get-RemoteTagCommitSha -ReleaseTag $Tag -GitHubRepo $gitHubRepo) -eq $targetCommitSha
-    $preserveExistingNotes = Test-ShouldPreserveExistingNotes -ExistingBody $existingBody -GeneratedBody $notesBody -DefaultBody $defaultReleaseBody
+if (-not $reusedExistingRelease -and -not (Test-RemoteCommitExists -CommitSha $targetCommitSha -GitHubRepo $gitHubRepo)) {
+    throw "Commit $targetCommitSha is not available on github.com/$gitHubRepo yet. Push the commit first, then rerun this script."
+}
 
-    if (-not $existingReleasePointsToTarget -or -not $preserveExistingNotes) {
-        $editArguments = @(
-            'release', 'edit', $Tag,
-            '--repo', $gitHubRepo,
-            '--title', $title
-        )
+try {
+    $releaseExistedBefore = Test-ReleaseExists -ReleaseTag $Tag -GitHubRepo $gitHubRepo
+    $shouldCleanupCreatedTagOnFailure = (-not $releaseExistedBefore) -and (-not $PSBoundParameters.ContainsKey('Tag'))
 
-        if (-not $preserveExistingNotes) {
-            $editArguments += @('--notes-file', $resolvedNotesPath)
+    if ($releaseExistedBefore) {
+        $existingBody = Get-ReleaseBody -ReleaseTag $Tag -GitHubRepo $gitHubRepo
+        $existingReleasePointsToTarget = (Get-RemoteTagCommitSha -ReleaseTag $Tag -GitHubRepo $gitHubRepo) -eq $targetCommitSha
+        $preserveExistingNotes = Test-ShouldPreserveExistingNotes -ExistingBody $existingBody -GeneratedBody $notesBody -DefaultBody $defaultReleaseBody
+
+        if (-not $existingReleasePointsToTarget -or -not $preserveExistingNotes) {
+            $editArguments = @(
+                'release', 'edit', $Tag,
+                '--repo', $gitHubRepo,
+                '--title', $title
+            )
+
+            if (-not $preserveExistingNotes) {
+                $editArguments += @('--notes-file', $resolvedNotesPath)
+            }
+
+            if ($Draft) {
+                $editArguments += '--draft'
+            }
+            if ($Prerelease) {
+                $editArguments += '--prerelease'
+            }
+            Invoke-External -FilePath 'gh' -Arguments $editArguments
         }
 
+        Invoke-External -FilePath 'gh' -Arguments @('release', 'upload', $Tag, $resolvedAssetPath, '--repo', $gitHubRepo, '--clobber')
+    } else {
+        $createArguments = @(
+            'release', 'create', $Tag, $resolvedAssetPath,
+            '--repo', $gitHubRepo,
+            '--title', $title,
+            '--notes-file', $resolvedNotesPath,
+            '--target', $targetCommitSha
+        )
         if ($Draft) {
-            $editArguments += '--draft'
+            $createArguments += '--draft'
         }
         if ($Prerelease) {
-            $editArguments += '--prerelease'
+            $createArguments += '--prerelease'
         }
-        Invoke-External -FilePath 'gh' -Arguments $editArguments
+        Invoke-External -FilePath 'gh' -Arguments $createArguments
+    }
+} catch {
+    if ($shouldCleanupCreatedTagOnFailure) {
+        Write-Warning "Release publishing failed. Cleaning up newly created tag/release '$Tag'."
+        Cleanup-CreatedTag -ReleaseTag $Tag -GitHubRepo $gitHubRepo
     }
 
-    Invoke-External -FilePath 'gh' -Arguments @('release', 'upload', $Tag, $resolvedAssetPath, '--repo', $gitHubRepo, '--clobber')
-} else {
-    $createArguments = @(
-        'release', 'create', $Tag, $resolvedAssetPath,
-        '--repo', $gitHubRepo,
-        '--title', $title,
-        '--notes-file', $resolvedNotesPath,
-        '--target', $targetCommitSha
-    )
-    if ($Draft) {
-        $createArguments += '--draft'
-    }
-    if ($Prerelease) {
-        $createArguments += '--prerelease'
-    }
-    Invoke-External -FilePath 'gh' -Arguments $createArguments
+    throw
 }
 
 Write-Output ''
