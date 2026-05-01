@@ -47,6 +47,11 @@ on:
         required: true
         type: boolean
         default: false
+      build_cli:
+        description: Build CLI artifacts for supported platforms.
+        required: true
+        type: boolean
+        default: false
       runner_linux_x86:
         description: Runner label for Linux x86_64 jobs.
         required: true
@@ -139,6 +144,7 @@ jobs:
       build_windows_arm: ${{ github.event_name == 'workflow_dispatch' && inputs.build_windows_arm || false }}
       build_macos: ${{ github.event_name == 'workflow_dispatch' && inputs.build_macos || false }}
       build_web: ${{ github.event_name == 'workflow_dispatch' && inputs.build_web || false }}
+      build_cli: ${{ github.event_name == 'workflow_dispatch' && inputs.build_cli || false }}
       should_publish: true
       publish_sentry: false
       publish_gcs: false
