@@ -67,7 +67,7 @@ pub(super) fn prepare_local_responses_request(
             normalize_openai_model_and_reasoning(&params.model.to_string());
         let instructions = build_local_openai_system_prompt(&normalized_model);
         let tools = build_tools_payload(params);
-        let include = responses_include_fields();
+        let include = responses_include_fields(params);
         let prompt_cache_key = build_prompt_cache_key(params);
         ResponsesRequestBody {
             instructions,
@@ -94,8 +94,12 @@ pub(super) fn prepare_local_responses_request(
 }
 
 /// Returns the extra Responses fields Warp needs preserved across stateless turns.
-fn responses_include_fields() -> Vec<String> {
-    vec!["reasoning.encrypted_content".to_string()]
+fn responses_include_fields(params: &RequestParams) -> Vec<String> {
+    let mut include = vec!["reasoning.encrypted_content".to_string()];
+    if params.web_search_enabled {
+        include.push("web_search_call.action.sources".to_string());
+    }
+    include
 }
 
 /// Builds a stable prompt cache key from Warp's conversation identity so repeated turns reuse the same cache route.
@@ -426,14 +430,37 @@ fn render_context_block(
 
 /// Converts a successful assistant text output into a conversation history item.
 pub(super) fn assistant_output_item(text: &str) -> Value {
+    assistant_output_item_with_annotations(text, Vec::new())
+}
+
+/// Converts assistant text plus replayable output-text annotations into a conversation history item.
+pub(super) fn assistant_output_item_with_annotations(text: &str, annotations: Vec<Value>) -> Value {
     json!({
         "type": "message",
         "role": "assistant",
         "content": [{
             "type": "output_text",
             "text": text,
+            "annotations": annotations,
         }],
     })
+}
+
+/// Converts persisted Warp citations back into replayable Responses output-text annotations.
+pub(super) fn output_text_annotations_from_api_citations(citations: &[api::Citation]) -> Vec<Value> {
+    citations
+        .iter()
+        .filter_map(|citation| {
+            (api::DocumentType::try_from(citation.document_type).ok()
+                == Some(api::DocumentType::WebPage))
+            .then(|| {
+                json!({
+                    "type": "url_citation",
+                    "url": citation.document_id,
+                })
+            })
+        })
+        .collect()
 }
 
 /// Converts a function call into a history item that can be replayed on later turns.
@@ -443,6 +470,33 @@ pub(super) fn function_call_history_item(function_call: &ParsedFunctionCall) -> 
         "call_id": function_call.call_id,
         "name": function_call.name,
         "arguments": function_call.arguments.to_string(),
+    })
+}
+
+/// Converts a web-search output item into a history item that can be replayed on later turns.
+pub(super) fn web_search_call_history_item(
+    query: Option<&str>,
+    status: &str,
+    pages: &[(String, String)],
+) -> Value {
+    let sources = pages
+        .iter()
+        .map(|(url, _title)| {
+            json!({
+                "type": "url",
+                "url": url,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "type": "web_search_call",
+        "status": status,
+        "action": {
+            "type": "search",
+            "query": query.unwrap_or_default(),
+            "sources": sources,
+        }
     })
 }
 
@@ -507,6 +561,11 @@ pub(super) fn build_tools_payload(params: &RequestParams) -> Vec<Value> {
         .into_iter()
         .filter_map(built_in_tool_schema)
         .collect::<Vec<_>>();
+    if params.web_search_enabled {
+        tools.push(json!({
+            "type": "web_search"
+        }));
+    }
     if supports_mcp_tools {
         tools.extend(mcp_tool_schemas(params.mcp_context.as_ref()));
     }
@@ -721,7 +780,10 @@ pub(super) fn task_history_response_items(params: &RequestParams) -> anyhow::Res
             }
             api::message::Message::AgentOutput(output) => {
                 if !output.text.is_empty() {
-                    items.push(assistant_output_item(&output.text));
+                    items.push(assistant_output_item_with_annotations(
+                        &output.text,
+                        output_text_annotations_from_api_citations(&message.citations),
+                    ));
                 }
             }
             api::message::Message::ToolCall(tool_call) => {
@@ -736,6 +798,11 @@ pub(super) fn task_history_response_items(params: &RequestParams) -> anyhow::Res
                     continue;
                 }
                 items.extend(history_items_from_message_inputs(message)?);
+            }
+            api::message::Message::WebSearch(web_search) => {
+                if let Some(history_item) = web_search_history_item_from_api(web_search) {
+                    items.push(history_item);
+                }
             }
             _ => {}
         }
@@ -776,6 +843,35 @@ fn tool_call_history_item_from_api(
         "name": name,
         "arguments": arguments.to_string(),
     })))
+}
+
+/// Converts a persisted web-search status message back into a replayable Responses output item.
+fn web_search_history_item_from_api(web_search: &api::message::WebSearch) -> Option<Value> {
+    match web_search.status.as_ref()?.r#type.as_ref()? {
+        api::message::web_search::status::Type::Searching(searching) => Some(
+            web_search_call_history_item(
+                (!searching.query.is_empty()).then_some(searching.query.as_str()),
+                "searching",
+                &[],
+            ),
+        ),
+        api::message::web_search::status::Type::Success(success) => Some(
+            web_search_call_history_item(
+                (!success.query.is_empty()).then_some(success.query.as_str()),
+                "completed",
+                &success
+                    .pages
+                    .iter()
+                    .map(|page| (page.url.clone(), page.title.clone()))
+                    .collect::<Vec<_>>(),
+            ),
+        ),
+        api::message::web_search::status::Type::Error(_) => Some(web_search_call_history_item(
+            None,
+            "failed",
+            &[],
+        )),
+    }
 }
 
 /// Converts a supported proto tool call into the local backend's function name plus JSON arguments.

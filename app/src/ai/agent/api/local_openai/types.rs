@@ -42,6 +42,10 @@ pub(super) struct ResponsesOutputItem {
     pub(super) call_id: Option<String>,
     #[serde(default)]
     pub(super) arguments: Option<String>,
+    #[serde(default)]
+    pub(super) status: Option<String>,
+    #[serde(default)]
+    pub(super) action: Option<ResponsesWebSearchAction>,
 }
 
 /// Parsed subset of a message content item returned by Responses.
@@ -51,6 +55,32 @@ pub(super) struct ResponsesContentItem {
     pub(super) item_type: String,
     #[serde(default)]
     pub(super) text: Option<String>,
+    #[serde(default)]
+    pub(super) annotations: Vec<ResponsesOutputTextAnnotation>,
+}
+
+/// Parsed subset of an `output_text` citation annotation returned by Responses.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ResponsesOutputTextAnnotation {
+    #[serde(rename = "type", default)]
+    pub(super) item_type: String,
+    #[serde(default)]
+    pub(super) url: Option<String>,
+    #[serde(default)]
+    pub(super) title: Option<String>,
+    #[serde(default)]
+    pub(super) url_citation: Option<ResponsesNestedUrlCitation>,
+}
+
+/// Parsed subset of a nested `url_citation` payload used by some compatible providers.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ResponsesNestedUrlCitation {
+    #[serde(rename = "type", default)]
+    pub(super) item_type: String,
+    #[serde(default)]
+    pub(super) url: Option<String>,
+    #[serde(default)]
+    pub(super) title: Option<String>,
 }
 
 /// Parsed subset of a reasoning summary part returned by Responses.
@@ -60,6 +90,26 @@ pub(super) struct ResponsesReasoningSummaryPart {
     pub(super) item_type: String,
     #[serde(default)]
     pub(super) text: Option<String>,
+}
+
+/// Parsed subset of a `web_search_call` action returned by Responses.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ResponsesWebSearchAction {
+    #[serde(rename = "type", default)]
+    pub(super) action_type: String,
+    #[serde(default)]
+    pub(super) query: Option<String>,
+    #[serde(default)]
+    pub(super) sources: Vec<ResponsesWebSearchSource>,
+}
+
+/// Parsed subset of a single web-search source returned by Responses when included explicitly.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ResponsesWebSearchSource {
+    #[serde(rename = "type", default)]
+    pub(super) source_type: String,
+    #[serde(default)]
+    pub(super) url: Option<String>,
 }
 
 /// Generic error envelope returned by OpenAI-compatible APIs.
@@ -118,6 +168,12 @@ pub(super) struct StreamingTextMessageState {
     pub(super) text: String,
 }
 
+/// Tracks a streamed web-search status message keyed by the Responses output item ID.
+#[derive(Debug, Clone)]
+pub(super) struct StreamingWebSearchState {
+    pub(super) message_id: String,
+}
+
 /// Tracks streamed reasoning text for a single Responses reasoning item.
 #[derive(Debug, Clone)]
 pub(super) struct StreamingReasoningMessageState {
@@ -142,12 +198,17 @@ pub(super) struct StreamingResponsesAccumulator {
     pub(super) stream_started_at: Instant,
     pub(super) text_messages_by_item_id: HashMap<String, StreamingTextMessageState>,
     pub(super) emitted_text_item_ids: Vec<String>,
+    pub(super) finalized_text_item_ids: Vec<String>,
     pub(super) reasoning_messages_by_key: HashMap<String, StreamingReasoningMessageState>,
     pub(super) emitted_reasoning_keys: Vec<String>,
     pub(super) reasoning_history_items_by_key: HashMap<String, Value>,
     pub(super) reasoning_history_item_keys_in_order: Vec<String>,
     pub(super) function_calls_by_call_id: HashMap<String, StreamingFunctionCallState>,
     pub(super) emitted_function_call_ids: Vec<String>,
+    pub(super) web_search_states_by_item_id: HashMap<String, StreamingWebSearchState>,
+    pub(super) emitted_web_search_item_ids: Vec<String>,
+    pub(super) replayable_history_items_by_key: HashMap<String, Value>,
+    pub(super) replayable_history_item_keys_in_order: Vec<String>,
 }
 
 impl Default for StreamingResponsesAccumulator {
@@ -156,12 +217,17 @@ impl Default for StreamingResponsesAccumulator {
             stream_started_at: Instant::now(),
             text_messages_by_item_id: HashMap::new(),
             emitted_text_item_ids: Vec::new(),
+            finalized_text_item_ids: Vec::new(),
             reasoning_messages_by_key: HashMap::new(),
             emitted_reasoning_keys: Vec::new(),
             reasoning_history_items_by_key: HashMap::new(),
             reasoning_history_item_keys_in_order: Vec::new(),
             function_calls_by_call_id: HashMap::new(),
             emitted_function_call_ids: Vec::new(),
+            web_search_states_by_item_id: HashMap::new(),
+            emitted_web_search_item_ids: Vec::new(),
+            replayable_history_items_by_key: HashMap::new(),
+            replayable_history_item_keys_in_order: Vec::new(),
         }
     }
 }
@@ -236,6 +302,12 @@ pub(super) struct ResponsesFunctionCallArgumentsDoneEvent {
 #[derive(Debug, Deserialize)]
 pub(super) struct ResponsesOutputItemDoneEvent {
     pub(super) item: ResponsesOutputItem,
+}
+
+/// Minimal typed view over a streamed web-search lifecycle event.
+#[derive(Debug, Deserialize)]
+pub(super) struct ResponsesWebSearchCallEvent {
+    pub(super) item_id: String,
 }
 
 /// Minimal typed view over a streamed completed event.

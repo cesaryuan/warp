@@ -17,7 +17,8 @@ use super::stream::{
 use super::tool_calls::parse_read_file;
 use super::types::{
     ResponsesApiResponse, ResponsesContentItem, ResponsesFunctionCallArgumentsDoneEvent,
-    ResponsesOutputItem, ResponsesReasoningSummaryPart, StreamingResponsesAccumulator,
+    ResponsesOutputItem, ResponsesOutputTextAnnotation, ResponsesReasoningSummaryPart,
+    ResponsesWebSearchAction, ResponsesWebSearchSource, StreamingResponsesAccumulator,
     StreamingTextMessageState,
 };
 use super::*;
@@ -51,6 +52,7 @@ fn request_params_for_local_backend_tests() -> RequestParams {
         computer_use_model: model,
         is_memory_enabled: false,
         warp_drive_context_enabled: false,
+        context_window_limit: None,
         mcp_context: None,
         planning_enabled: true,
         should_redact_secrets: false,
@@ -511,6 +513,34 @@ fn prepare_local_responses_request_sets_session_id_header_from_prompt_cache_key(
     );
 }
 
+/// Verifies that web search is exposed to the local Responses backend when enabled.
+#[test]
+fn prepare_local_responses_request_includes_web_search_tool_when_enabled() {
+    let mut params = request_params_for_local_backend_tests();
+    params.local_openai_api_key = Some("test-key".to_string());
+    params.local_openai_base_url = Some("https://example.com".to_string());
+    params.web_search_enabled = true;
+
+    let prepared_request =
+        prepare_local_responses_request(&params).expect("request should prepare successfully");
+    let request_body = serde_json::to_value(&prepared_request.request_body)
+        .expect("request body should serialize");
+    let tools = request_body["tools"]
+        .as_array()
+        .expect("tools should serialize as an array");
+
+    assert!(tools
+        .iter()
+        .any(|tool| tool["type"] == serde_json::json!("web_search")));
+    assert_eq!(
+        request_body["include"],
+        serde_json::json!([
+            "reasoning.encrypted_content",
+            "web_search_call.action.sources"
+        ])
+    );
+}
+
 /// Verifies that streaming text deltas update the existing agent output field.
 #[test]
 fn update_agent_output_text_event_replaces_text() {
@@ -520,6 +550,7 @@ fn update_agent_output_text_event_replaces_text() {
         &task_id,
         "request-id",
         "hello".to_string(),
+        vec![],
     );
     let update_event = update_agent_output_text_event(
         &task_id,
@@ -659,6 +690,8 @@ fn finalize_stream_state_backfills_reasoning_messages_from_completed_output() {
                     name: None,
                     call_id: None,
                     arguments: None,
+                    status: None,
+                    action: None,
                 },
                 ResponsesOutputItem {
                     id: Some("msg_1".to_string()),
@@ -667,12 +700,15 @@ fn finalize_stream_state_backfills_reasoning_messages_from_completed_output() {
                     content: vec![ResponsesContentItem {
                         item_type: "output_text".to_string(),
                         text: Some("Done".to_string()),
+                        annotations: vec![],
                     }],
                     summary: vec![],
                     encrypted_content: None,
                     name: None,
                     call_id: None,
                     arguments: None,
+                    status: None,
+                    action: None,
                 },
             ],
         }),
@@ -735,6 +771,397 @@ fn finalize_stream_state_backfills_reasoning_messages_from_completed_output() {
         .remove(&params.conversation_id);
 }
 
+/// Verifies that completed web-search outputs become Warp web-search messages and webpage citations.
+#[test]
+fn finalize_stream_state_backfills_web_search_and_webpage_citations() {
+    let params = request_params_for_local_backend_tests();
+    conversation_state_store()
+        .lock()
+        .insert(params.conversation_id, LocalConversationState::default());
+
+    let events = finalize_stream_state(
+        &params,
+        StreamingResponsesAccumulator::default(),
+        "request-id",
+        Some(ResponsesApiResponse {
+            output: vec![
+                ResponsesOutputItem {
+                    id: Some("ws_1".to_string()),
+                    item_type: "web_search_call".to_string(),
+                    role: None,
+                    content: vec![],
+                    summary: vec![],
+                    encrypted_content: None,
+                    name: None,
+                    call_id: None,
+                    arguments: None,
+                    status: Some("completed".to_string()),
+                    action: Some(ResponsesWebSearchAction {
+                        action_type: "search".to_string(),
+                        query: Some("rust async".to_string()),
+                        sources: vec![ResponsesWebSearchSource {
+                            source_type: "url".to_string(),
+                            url: Some("https://example.com/rust-async".to_string()),
+                        }],
+                    }),
+                },
+                ResponsesOutputItem {
+                    id: Some("msg_1".to_string()),
+                    item_type: "message".to_string(),
+                    role: Some("assistant".to_string()),
+                    content: vec![ResponsesContentItem {
+                        item_type: "output_text".to_string(),
+                        text: Some("Rust async overview".to_string()),
+                        annotations: vec![ResponsesOutputTextAnnotation {
+                            item_type: "url_citation".to_string(),
+                            url: Some("https://example.com/rust-async".to_string()),
+                            title: Some("Rust Async Guide".to_string()),
+                            url_citation: None,
+                        }],
+                    }],
+                    summary: vec![],
+                    encrypted_content: None,
+                    name: None,
+                    call_id: None,
+                    arguments: None,
+                    status: None,
+                    action: None,
+                },
+            ],
+        }),
+    )
+    .expect("completed payload should finalize");
+
+    assert_eq!(events.len(), 2);
+    let add_messages_event = events[0].as_ref().expect("add-messages event should be ok");
+    let Some(api::response_event::Type::ClientActions(actions)) = &add_messages_event.r#type else {
+        panic!("expected client actions");
+    };
+    let Some(api::client_action::Action::AddMessagesToTask(add_messages)) =
+        actions.actions[0].action.as_ref()
+    else {
+        panic!("expected add-messages action");
+    };
+
+    let web_search = add_messages
+        .messages
+        .iter()
+        .find_map(|message| match &message.message {
+            Some(api::message::Message::WebSearch(web_search)) => Some(web_search),
+            _ => None,
+        })
+        .expect("expected a web-search message");
+    let Some(api::message::web_search::status::Type::Success(success)) =
+        web_search.status.as_ref().and_then(|status| status.r#type.as_ref())
+    else {
+        panic!("expected a completed web-search status");
+    };
+    assert_eq!(success.query, "rust async");
+    assert_eq!(success.pages.len(), 1);
+    assert_eq!(success.pages[0].url, "https://example.com/rust-async");
+    assert_eq!(success.pages[0].title, "Rust Async Guide");
+
+    let agent_output = add_messages
+        .messages
+        .iter()
+        .find_map(|message| match &message.message {
+            Some(api::message::Message::AgentOutput(_agent_output)) => Some(message),
+            _ => None,
+        })
+        .expect("expected an agent output message");
+    assert_eq!(agent_output.citations.len(), 1);
+    assert_eq!(
+        agent_output.citations[0].document_id,
+        "https://example.com/rust-async"
+    );
+    assert_eq!(
+        agent_output.citations[0].document_type,
+        api::DocumentType::WebPage as i32
+    );
+
+    conversation_state_store()
+        .lock()
+        .remove(&params.conversation_id);
+}
+
+/// Verifies that `response.output_item.done` can emit a completed web-search message directly.
+#[test]
+fn streamed_output_item_done_emits_completed_web_search_message() {
+    let params = request_params_for_local_backend_tests();
+    let task_id = TaskId::new("task-id".to_string());
+    let mut accumulator = StreamingResponsesAccumulator::default();
+
+    let result = handle_responses_stream_message(
+        &params,
+        &task_id,
+        "request-id",
+        "response.output_item.done",
+        r#"{"item":{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"rust async","sources":[{"type":"url","url":"https://example.com/rust-async"}]}}}"#,
+        &mut accumulator,
+    )
+    .expect("web-search output_item.done should parse");
+
+    assert_eq!(result.events.len(), 1);
+    let event = result.events[0].as_ref().expect("event should be ok");
+    let Some(api::response_event::Type::ClientActions(actions)) = &event.r#type else {
+        panic!("expected client actions");
+    };
+    let Some(api::client_action::Action::AddMessagesToTask(add_messages)) =
+        actions.actions[0].action.as_ref()
+    else {
+        panic!("expected add-messages action");
+    };
+    let web_search = add_messages
+        .messages
+        .iter()
+        .find_map(|message| match &message.message {
+            Some(api::message::Message::WebSearch(web_search)) => Some(web_search),
+            _ => None,
+        })
+        .expect("expected a web-search message");
+    let Some(api::message::web_search::status::Type::Success(success)) =
+        web_search.status.as_ref().and_then(|status| status.r#type.as_ref())
+    else {
+        panic!("expected a completed web-search status");
+    };
+    assert_eq!(success.query, "rust async");
+    assert_eq!(success.pages.len(), 1);
+    assert_eq!(success.pages[0].url, "https://example.com/rust-async");
+}
+
+/// Verifies that streamed web-search progress updates the same task message when the output item completes.
+#[test]
+fn streamed_web_search_searching_event_updates_to_success_on_output_item_done() {
+    let params = request_params_for_local_backend_tests();
+    let task_id = TaskId::new("task-id".to_string());
+    let mut accumulator = StreamingResponsesAccumulator::default();
+
+    let searching_result = handle_responses_stream_message(
+        &params,
+        &task_id,
+        "request-id",
+        "response.web_search_call.searching",
+        r#"{"item_id":"ws_1"}"#,
+        &mut accumulator,
+    )
+    .expect("searching event should parse");
+    assert_eq!(searching_result.events.len(), 1);
+
+    let searching_event = searching_result.events[0]
+        .as_ref()
+        .expect("searching event should be ok");
+    let Some(api::response_event::Type::ClientActions(searching_actions)) = &searching_event.r#type
+    else {
+        panic!("expected client actions");
+    };
+    let Some(api::client_action::Action::AddMessagesToTask(searching_add)) =
+        searching_actions.actions[0].action.as_ref()
+    else {
+        panic!("expected add-messages action");
+    };
+    let initial_message = searching_add.messages[0].clone();
+
+    let done_result = handle_responses_stream_message(
+        &params,
+        &task_id,
+        "request-id",
+        "response.output_item.done",
+        r#"{"item":{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"rust async","sources":[{"type":"url","url":"https://example.com/rust-async"}]}}}"#,
+        &mut accumulator,
+    )
+    .expect("web-search output_item.done should parse");
+    assert_eq!(done_result.events.len(), 1);
+
+    let done_event = done_result.events[0].as_ref().expect("done event should be ok");
+    let Some(api::response_event::Type::ClientActions(done_actions)) = &done_event.r#type else {
+        panic!("expected client actions");
+    };
+    let Some(api::client_action::Action::UpdateTaskMessage(update)) =
+        done_actions.actions[0].action.as_ref()
+    else {
+        panic!("expected update action");
+    };
+    let merged = field_mask::FieldMaskOperation::update(
+        &api::MESSAGE_DESCRIPTOR,
+        &initial_message,
+        update
+            .message
+            .as_ref()
+            .expect("update message should exist"),
+        update.mask.clone().expect("update mask should exist"),
+    )
+    .apply()
+    .expect("web-search update should succeed");
+
+    let Some(api::message::Message::WebSearch(web_search)) = merged.message else {
+        panic!("expected web-search message");
+    };
+    let Some(api::message::web_search::status::Type::Success(success)) =
+        web_search.status.as_ref().and_then(|status| status.r#type.as_ref())
+    else {
+        panic!("expected a completed web-search status");
+    };
+    assert_eq!(success.query, "rust async");
+    assert_eq!(success.pages.len(), 1);
+    assert_eq!(success.pages[0].url, "https://example.com/rust-async");
+}
+
+/// Verifies that `response.output_item.done` can finalize streamed assistant citations without `response.completed`.
+#[test]
+fn streamed_output_item_done_updates_streamed_text_with_citations() {
+    let params = request_params_for_local_backend_tests();
+    let task_id = TaskId::new("task-id".to_string());
+    let mut accumulator = StreamingResponsesAccumulator::default();
+
+    let delta_result = handle_responses_stream_message(
+        &params,
+        &task_id,
+        "request-id",
+        "response.output_text.delta",
+        r#"{"item_id":"msg_1","delta":"Rust async overview"}"#,
+        &mut accumulator,
+    )
+    .expect("text delta should parse");
+    let initial_event = delta_result.events[0].as_ref().expect("delta event should be ok");
+    let Some(api::response_event::Type::ClientActions(initial_actions)) = &initial_event.r#type else {
+        panic!("expected client actions");
+    };
+    let Some(api::client_action::Action::AddMessagesToTask(initial_add)) =
+        initial_actions.actions[0].action.as_ref()
+    else {
+        panic!("expected add-messages action");
+    };
+    let initial_message = initial_add.messages[0].clone();
+
+    let done_result = handle_responses_stream_message(
+        &params,
+        &task_id,
+        "request-id",
+        "response.output_item.done",
+        r#"{"item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"Rust async overview","annotations":[{"type":"url_citation","url":"https://example.com/rust-async","title":"Rust Async Guide"}]}]}}"#,
+        &mut accumulator,
+    )
+    .expect("assistant output_item.done should parse");
+    assert_eq!(done_result.events.len(), 1);
+
+    let done_event = done_result.events[0].as_ref().expect("done event should be ok");
+    let Some(api::response_event::Type::ClientActions(done_actions)) = &done_event.r#type else {
+        panic!("expected client actions");
+    };
+    let Some(api::client_action::Action::UpdateTaskMessage(update)) =
+        done_actions.actions[0].action.as_ref()
+    else {
+        panic!("expected update action");
+    };
+    let merged = field_mask::FieldMaskOperation::update(
+        &api::MESSAGE_DESCRIPTOR,
+        &initial_message,
+        update
+            .message
+            .as_ref()
+            .expect("update message should exist"),
+        update.mask.clone().expect("update mask should exist"),
+    )
+    .apply()
+    .expect("assistant message update should succeed");
+
+    let Some(api::message::Message::AgentOutput(agent_output)) = merged.message else {
+        panic!("expected agent output message");
+    };
+    assert_eq!(agent_output.text, "Rust async overview");
+    assert_eq!(merged.citations.len(), 1);
+    assert_eq!(
+        merged.citations[0].document_id,
+        "https://example.com/rust-async"
+    );
+}
+
+/// Verifies that completed assistant messages can attach citations onto text streamed earlier.
+#[test]
+fn finalize_stream_state_updates_streamed_text_with_webpage_citations() {
+    let params = request_params_for_local_backend_tests();
+    let task_id = TaskId::new("task-id".to_string());
+    let mut accumulator = StreamingResponsesAccumulator::default();
+    accumulator.emitted_text_item_ids.push("msg_1".to_string());
+    accumulator.text_messages_by_item_id.insert(
+        "msg_1".to_string(),
+        StreamingTextMessageState {
+            message_id: "message-1".to_string(),
+            text: "Rust async overview".to_string(),
+        },
+    );
+
+    let events = finalize_stream_state(
+        &params,
+        accumulator,
+        "request-id",
+        Some(ResponsesApiResponse {
+            output: vec![ResponsesOutputItem {
+                id: Some("msg_1".to_string()),
+                item_type: "message".to_string(),
+                role: Some("assistant".to_string()),
+                content: vec![ResponsesContentItem {
+                    item_type: "output_text".to_string(),
+                    text: Some("Rust async overview".to_string()),
+                    annotations: vec![ResponsesOutputTextAnnotation {
+                        item_type: "url_citation".to_string(),
+                        url: Some("https://example.com/rust-async".to_string()),
+                        title: Some("Rust Async Guide".to_string()),
+                        url_citation: None,
+                    }],
+                }],
+                summary: vec![],
+                encrypted_content: None,
+                name: None,
+                call_id: None,
+                arguments: None,
+                status: None,
+                action: None,
+            }],
+        }),
+    )
+    .expect("completed payload should finalize");
+
+    assert_eq!(events.len(), 2);
+    let update_event = events[0].as_ref().expect("update event should be ok");
+    let Some(api::response_event::Type::ClientActions(actions)) = &update_event.r#type else {
+        panic!("expected client actions");
+    };
+    let Some(api::client_action::Action::UpdateTaskMessage(update)) =
+        actions.actions[0].action.as_ref()
+    else {
+        panic!("expected update action");
+    };
+    let initial_message = agent_output_message_with_id(
+        "message-1".to_string(),
+        &task_id,
+        "request-id",
+        "Rust async overview".to_string(),
+        vec![],
+    );
+    let merged = field_mask::FieldMaskOperation::update(
+        &api::MESSAGE_DESCRIPTOR,
+        &initial_message,
+        update
+            .message
+            .as_ref()
+            .expect("update message should exist"),
+        update.mask.clone().expect("update mask should exist"),
+    )
+    .apply()
+    .expect("citation update should succeed");
+
+    assert_eq!(merged.citations.len(), 1);
+    assert_eq!(
+        merged.citations[0].document_id,
+        "https://example.com/rust-async"
+    );
+    assert_eq!(
+        merged.citations[0].document_type,
+        api::DocumentType::WebPage as i32
+    );
+}
+
 /// Verifies that reasoning encrypted content captured from `output_item.done` survives even if `response.completed` omits the reasoning item.
 #[test]
 fn finalize_stream_state_preserves_reasoning_history_from_output_item_done() {
@@ -768,12 +1195,15 @@ fn finalize_stream_state_preserves_reasoning_history_from_output_item_done() {
                 content: vec![ResponsesContentItem {
                     item_type: "output_text".to_string(),
                     text: Some("Done".to_string()),
+                    annotations: vec![],
                 }],
                 summary: vec![],
                 encrypted_content: None,
                 name: None,
                 call_id: None,
                 arguments: None,
+                status: None,
+                action: None,
             }],
         }),
     )
@@ -835,6 +1265,8 @@ fn finalize_stream_state_preserves_empty_reasoning_summary_array() {
                 name: None,
                 call_id: None,
                 arguments: None,
+                status: None,
+                action: None,
             }],
         }),
     )
@@ -897,6 +1329,68 @@ fn finalize_stream_state_accepts_empty_completed_payload_after_streamed_text() {
         .remove(&params.conversation_id);
 }
 
+/// Verifies that streamed output-item completions are replayed even when `response.completed.output` is empty.
+#[test]
+fn finalize_stream_state_replays_streamed_output_items_when_completed_output_is_empty() {
+    let params = request_params_for_local_backend_tests();
+    let task_id = TaskId::new("task-id".to_string());
+    conversation_state_store()
+        .lock()
+        .insert(params.conversation_id, LocalConversationState::default());
+    let mut accumulator = StreamingResponsesAccumulator::default();
+
+    handle_responses_stream_message(
+        &params,
+        &task_id,
+        "request-id",
+        "response.output_item.done",
+        r#"{"item":{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"rust async","sources":[{"type":"url","url":"https://example.com/rust-async"}]}}}"#,
+        &mut accumulator,
+    )
+    .expect("web-search output item should parse");
+    handle_responses_stream_message(
+        &params,
+        &task_id,
+        "request-id",
+        "response.output_item.done",
+        r#"{"item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"Rust async overview","annotations":[{"type":"url_citation","url":"https://example.com/rust-async","title":"Rust Async Guide"}]}]}}"#,
+        &mut accumulator,
+    )
+    .expect("assistant output item should parse");
+
+    finalize_stream_state(
+        &params,
+        accumulator,
+        "request-id",
+        Some(ResponsesApiResponse { output: vec![] }),
+    )
+    .expect("empty completed payload should still preserve streamed output items");
+
+    let stored_items = conversation_state_store()
+        .lock()
+        .get(&params.conversation_id)
+        .cloned()
+        .expect("conversation state should exist")
+        .items;
+    assert_eq!(stored_items.len(), 2);
+    assert_eq!(stored_items[0]["type"], "web_search_call");
+    assert_eq!(stored_items[0]["status"], "completed");
+    assert_eq!(
+        stored_items[0]["action"]["sources"][0]["url"],
+        "https://example.com/rust-async"
+    );
+    assert_eq!(stored_items[1]["type"], "message");
+    assert_eq!(stored_items[1]["content"][0]["text"], "Rust async overview");
+    assert_eq!(
+        stored_items[1]["content"][0]["annotations"][0]["url"],
+        "https://example.com/rust-async"
+    );
+
+    conversation_state_store()
+        .lock()
+        .remove(&params.conversation_id);
+}
+
 /// Verifies that streamed function calls wait for output_item metadata when call_id is missing.
 #[test]
 fn streamed_function_calls_use_output_item_done_to_get_real_call_id() {
@@ -932,6 +1426,8 @@ fn streamed_function_calls_use_output_item_done_to_get_real_call_id() {
             name: Some("file_glob".to_string()),
             call_id: Some("call_real_123".to_string()),
             arguments: Some(r#"{"path":"."}"#.to_string()),
+            status: None,
+            action: None,
         },
     )
     .expect("output_item.done should not error")
@@ -977,6 +1473,8 @@ fn streamed_function_calls_wait_for_output_item_name() {
             name: Some("file_glob".to_string()),
             call_id: Some("call_real_456".to_string()),
             arguments: Some(r#"{"path":"."}"#.to_string()),
+            status: None,
+            action: None,
         },
     )
     .expect("output_item.done should not error")
@@ -1010,6 +1508,8 @@ fn streamed_function_calls_fall_back_to_item_id_when_output_item_has_no_call_id(
             name: Some("file_glob".to_string()),
             call_id: None,
             arguments: Some(r#"{"path":"."}"#.to_string()),
+            status: None,
+            action: None,
         },
     )
     .expect("output_item.done should not error")
@@ -1217,7 +1717,10 @@ fn task_history_response_items_restore_prior_messages() {
                 id: "message-output".to_string(),
                 task_id: "task-id".to_string(),
                 server_message_data: String::new(),
-                citations: vec![],
+                citations: vec![api::Citation {
+                    document_id: "https://example.com/prior-answer".to_string(),
+                    document_type: api::DocumentType::WebPage as i32,
+                }],
                 request_id: "request-1".to_string(),
                 timestamp: None,
                 message: Some(api::message::Message::AgentOutput(
@@ -1225,6 +1728,27 @@ fn task_history_response_items_restore_prior_messages() {
                         text: "prior answer".to_string(),
                     },
                 )),
+            },
+            api::Message {
+                id: "message-web-search".to_string(),
+                task_id: "task-id".to_string(),
+                server_message_data: String::new(),
+                citations: vec![],
+                request_id: "request-1".to_string(),
+                timestamp: None,
+                message: Some(api::message::Message::WebSearch(api::message::WebSearch {
+                    status: Some(api::message::web_search::Status {
+                        r#type: Some(api::message::web_search::status::Type::Success(
+                            api::message::web_search::status::Success {
+                                query: "prior question".to_string(),
+                                pages: vec![api::message::web_search::status::success::SearchedPage {
+                                    url: "https://example.com/prior-answer".to_string(),
+                                    title: "Prior Answer".to_string(),
+                                }],
+                            },
+                        )),
+                    }),
+                })),
             },
         ],
         dependencies: None,
@@ -1234,7 +1758,7 @@ fn task_history_response_items_restore_prior_messages() {
     }];
 
     let items = task_history_response_items(&params).expect("task history should convert");
-    assert_eq!(items.len(), 4);
+    assert_eq!(items.len(), 5);
     assert_eq!(items[0]["role"], "user");
     assert_eq!(items[1]["type"], "function_call");
     assert_eq!(items[1]["name"], "read_files");
@@ -1242,6 +1766,17 @@ fn task_history_response_items_restore_prior_messages() {
     assert_eq!(items[2]["call_id"], "call_1");
     assert_eq!(items[3]["role"], "assistant");
     assert_eq!(items[3]["content"][0]["text"], "prior answer");
+    assert_eq!(
+        items[3]["content"][0]["annotations"][0]["url"],
+        "https://example.com/prior-answer"
+    );
+    assert_eq!(items[4]["type"], "web_search_call");
+    assert_eq!(items[4]["status"], "completed");
+    assert_eq!(items[4]["action"]["query"], "prior question");
+    assert_eq!(
+        items[4]["action"]["sources"][0]["url"],
+        "https://example.com/prior-answer"
+    );
 }
 
 /// Verifies that transient provider status codes are retried by the local backend.
