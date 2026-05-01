@@ -168,6 +168,12 @@ pub(super) struct StreamingTextMessageState {
     pub(super) text: String,
 }
 
+/// Tracks a streamed web-search status message keyed by the Responses output item ID.
+#[derive(Debug, Clone)]
+pub(super) struct StreamingWebSearchState {
+    pub(super) message_id: String,
+}
+
 /// Tracks streamed reasoning text for a single Responses reasoning item.
 #[derive(Debug, Clone)]
 pub(super) struct StreamingReasoningMessageState {
@@ -192,12 +198,15 @@ pub(super) struct StreamingResponsesAccumulator {
     pub(super) stream_started_at: Instant,
     pub(super) text_messages_by_item_id: HashMap<String, StreamingTextMessageState>,
     pub(super) emitted_text_item_ids: Vec<String>,
+    pub(super) finalized_text_item_ids: Vec<String>,
     pub(super) reasoning_messages_by_key: HashMap<String, StreamingReasoningMessageState>,
     pub(super) emitted_reasoning_keys: Vec<String>,
     pub(super) reasoning_history_items_by_key: HashMap<String, Value>,
     pub(super) reasoning_history_item_keys_in_order: Vec<String>,
     pub(super) function_calls_by_call_id: HashMap<String, StreamingFunctionCallState>,
     pub(super) emitted_function_call_ids: Vec<String>,
+    pub(super) web_search_states_by_item_id: HashMap<String, StreamingWebSearchState>,
+    pub(super) emitted_web_search_item_ids: Vec<String>,
 }
 
 impl Default for StreamingResponsesAccumulator {
@@ -206,12 +215,15 @@ impl Default for StreamingResponsesAccumulator {
             stream_started_at: Instant::now(),
             text_messages_by_item_id: HashMap::new(),
             emitted_text_item_ids: Vec::new(),
+            finalized_text_item_ids: Vec::new(),
             reasoning_messages_by_key: HashMap::new(),
             emitted_reasoning_keys: Vec::new(),
             reasoning_history_items_by_key: HashMap::new(),
             reasoning_history_item_keys_in_order: Vec::new(),
             function_calls_by_call_id: HashMap::new(),
             emitted_function_call_ids: Vec::new(),
+            web_search_states_by_item_id: HashMap::new(),
+            emitted_web_search_item_ids: Vec::new(),
         }
     }
 }
@@ -286,6 +298,12 @@ pub(super) struct ResponsesFunctionCallArgumentsDoneEvent {
 #[derive(Debug, Deserialize)]
 pub(super) struct ResponsesOutputItemDoneEvent {
     pub(super) item: ResponsesOutputItem,
+}
+
+/// Minimal typed view over a streamed web-search lifecycle event.
+#[derive(Debug, Deserialize)]
+pub(super) struct ResponsesWebSearchCallEvent {
+    pub(super) item_id: String,
 }
 
 /// Minimal typed view over a streamed completed event.
