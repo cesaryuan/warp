@@ -216,16 +216,23 @@ function Build-ReleaseNotes {
     param(
         [string[]]$Subjects,
         [string]$StartRef,
-        [string]$EndRef
+        [string]$EndRef,
+        [string]$GitHubRepo,
+        [string]$TargetCommitSha
     )
 
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('# Release Notes')
 
     if (-not [string]::IsNullOrWhiteSpace($StartRef)) {
-        $lines.Add(("Commit range: `{0}..{1}" -f $StartRef, $EndRef))
+        $shortSha = if ($TargetCommitSha.Length -ge 8) { $TargetCommitSha.Substring(0, 8) } else { $TargetCommitSha }
+        $compareLabel = "$StartRef...$shortSha"
+        $compareUrl = "https://github.com/$GitHubRepo/compare/$StartRef...$TargetCommitSha"
+        $lines.Add("Commit range: [$compareLabel]($compareUrl)")
     } else {
-        $lines.Add(("Commit ref: `{0}" -f $EndRef))
+        $shortSha = if ($TargetCommitSha.Length -ge 8) { $TargetCommitSha.Substring(0, 8) } else { $TargetCommitSha }
+        $commitUrl = "https://github.com/$GitHubRepo/commit/$TargetCommitSha"
+        $lines.Add("Commit: [$shortSha]($commitUrl)")
     }
 
     $lines.Add('')
@@ -431,7 +438,7 @@ if ([string]::IsNullOrWhiteSpace($Tag)) {
 
 $effectiveBaseRef = Resolve-BaseRef -ExplicitBaseRef $BaseRef -TargetTag $Tag -TargetRef $ToRef
 $commitSubjects = Get-CommitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef -CommitAuthorPattern $AuthorPattern
-$notesBody = Build-ReleaseNotes -Subjects $commitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef
+$notesBody = Build-ReleaseNotes -Subjects $commitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef -GitHubRepo $gitHubRepo -TargetCommitSha $targetCommitSha
 $resolvedNotesPath = Get-NotesFilePath -ExplicitPath $NotesPath -ReleaseTag $Tag
 Set-Content -LiteralPath $resolvedNotesPath -Value $notesBody -Encoding utf8
 
@@ -464,7 +471,7 @@ if (-not [string]::IsNullOrWhiteSpace($existingReleaseTag) -and $existingRelease
     $reusedExistingRelease = $true
     $effectiveBaseRef = Resolve-BaseRef -ExplicitBaseRef $BaseRef -TargetTag $Tag -TargetRef $ToRef
     $commitSubjects = Get-CommitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef -CommitAuthorPattern $AuthorPattern
-    $notesBody = Build-ReleaseNotes -Subjects $commitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef
+    $notesBody = Build-ReleaseNotes -Subjects $commitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef -GitHubRepo $gitHubRepo -TargetCommitSha $targetCommitSha
     $resolvedNotesPath = Get-NotesFilePath -ExplicitPath $NotesPath -ReleaseTag $Tag
     Set-Content -LiteralPath $resolvedNotesPath -Value $notesBody -Encoding utf8
     $title = "$releaseBaseName $Tag"
@@ -472,7 +479,7 @@ if (-not [string]::IsNullOrWhiteSpace($existingReleaseTag) -and $existingRelease
     $Tag = New-ReleaseTag -ReleaseChannel $Channel -GitHubRepo $gitHubRepo
     $effectiveBaseRef = Resolve-BaseRef -ExplicitBaseRef $BaseRef -TargetTag $Tag -TargetRef $ToRef
     $commitSubjects = Get-CommitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef -CommitAuthorPattern $AuthorPattern
-    $notesBody = Build-ReleaseNotes -Subjects $commitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef
+    $notesBody = Build-ReleaseNotes -Subjects $commitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef -GitHubRepo $gitHubRepo -TargetCommitSha $targetCommitSha
     $resolvedNotesPath = Get-NotesFilePath -ExplicitPath $NotesPath -ReleaseTag $Tag
     Set-Content -LiteralPath $resolvedNotesPath -Value $notesBody -Encoding utf8
     $title = "$releaseBaseName $Tag"
