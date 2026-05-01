@@ -672,7 +672,7 @@ jobs:
     runs-on: ${{ inputs.runner_linux_x86 }}
     needs: prepare_release
     if: ${{ inputs.build_linux != false }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       # Automatically extract AppImages before running them instead of mounting
       # them with FUSE, which isn't available on GitHub runners (and this is
@@ -834,7 +834,7 @@ jobs:
     runs-on: ${{ inputs.runner_linux_x86 }}
     needs: prepare_release
     if: ${{ inputs.build_linux != false }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -1008,7 +1008,7 @@ jobs:
     runs-on: ${{ inputs.runner_linux_arm }}
     needs: prepare_release
     if: ${{ inputs.build_linux != false && inputs.build_linux_arm != false }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       # Automatically extract AppImages before running them instead of mounting
       # them with FUSE, which isn't available on GitHub runners (and this is
@@ -1107,7 +1107,7 @@ jobs:
     runs-on: ${{ inputs.runner_linux_arm }}
     needs: prepare_release
     if: ${{ inputs.build_linux != false && inputs.build_linux_arm != false }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
