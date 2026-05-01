@@ -28,6 +28,7 @@ pub(super) struct PreparedLocalResponsesRequest {
     pub(super) api_key: String,
     pub(super) endpoint: String,
     pub(super) request_body: ResponsesRequestBody,
+    pub(super) session_id_header: Option<String>,
 }
 
 /// Prepares a local Responses request after recording the new inputs in conversation state once.
@@ -64,24 +65,31 @@ pub(super) fn prepare_local_responses_request(
             .unwrap_or_default();
         let (normalized_model, reasoning) =
             normalize_openai_model_and_reasoning(&params.model.to_string());
+        let instructions = build_local_openai_system_prompt(&normalized_model);
+        let tools = build_tools_payload(params);
+        let include = responses_include_fields();
+        let prompt_cache_key = build_prompt_cache_key(params);
         ResponsesRequestBody {
-            instructions: build_local_openai_system_prompt(&normalized_model),
+            instructions,
             model: normalized_model,
             reasoning,
-            include: responses_include_fields(),
+            prompt_cache_key,
+            include,
             input: state.items,
-            tools: build_tools_payload(params),
+            tools,
             tool_choice: "auto",
             parallel_tool_calls: true,
             store: false,
             stream: true,
         }
     };
+    let session_id_header = build_session_id_header(request_body.prompt_cache_key.as_deref());
 
     Ok(PreparedLocalResponsesRequest {
         api_key,
         endpoint,
         request_body,
+        session_id_header,
     })
 }
 
@@ -90,17 +98,29 @@ fn responses_include_fields() -> Vec<String> {
     vec!["reasoning.encrypted_content".to_string()]
 }
 
+/// Builds a stable prompt cache key from Warp's conversation identity so repeated turns reuse the same cache route.
+fn build_prompt_cache_key(params: &RequestParams) -> Option<String> {
+    Some(params.conversation_id.to_string())
+}
+
+/// Mirrors the prompt cache key into the provider-specific session header value.
+fn build_session_id_header(prompt_cache_key: Option<&str>) -> Option<String> {
+    prompt_cache_key.map(ToOwned::to_owned)
+}
+
 /// Opens a local Responses event stream from a prepared request payload.
 pub(super) async fn open_local_responses_eventsource(
     server_api: &ServerApi,
     prepared_request: &PreparedLocalResponsesRequest,
 ) -> anyhow::Result<http_client::EventSourceStream> {
-    Ok(server_api
+    let mut request = server_api
         .http_client()
         .post(prepared_request.endpoint.clone())
-        .bearer_auth(prepared_request.api_key.clone())
-        .json(&prepared_request.request_body)
-        .eventsource())
+        .bearer_auth(prepared_request.api_key.clone());
+    if let Some(session_id) = prepared_request.session_id_header.as_deref() {
+        request = request.header("Session_id", session_id);
+    }
+    Ok(request.json(&prepared_request.request_body).eventsource())
 }
 
 /// Converts an SSE stream error into the closest local backend error shape we can expose.
@@ -435,27 +455,20 @@ pub(super) fn reasoning_history_item(item: &ResponsesOutputItem) -> Option<Value
         "encrypted_content".to_string(),
         Value::String(encrypted_content.to_string()),
     );
-
-    if let Some(id) = item.id.as_ref().filter(|id| !id.is_empty()) {
-        history_item.insert("id".to_string(), Value::String(id.clone()));
-    }
-
-    if !item.summary.is_empty() {
-        history_item.insert(
-            "summary".to_string(),
-            Value::Array(
-                item.summary
-                    .iter()
-                    .map(|part| {
-                        json!({
-                            "type": part.item_type,
-                            "text": part.text,
-                        })
+    history_item.insert(
+        "summary".to_string(),
+        Value::Array(
+            item.summary
+                .iter()
+                .map(|part| {
+                    json!({
+                        "type": part.item_type,
+                        "text": part.text,
                     })
-                    .collect(),
-            ),
-        );
-    }
+                })
+                .collect(),
+        ),
+    );
 
     if !item.content.is_empty() {
         history_item.insert(

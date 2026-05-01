@@ -418,6 +418,97 @@ fn prepare_local_responses_request_configures_parallel_tool_calls_and_store_poli
         request_body["include"],
         serde_json::json!(["reasoning.encrypted_content"])
     );
+    assert_eq!(
+        request_body["prompt_cache_key"],
+        serde_json::json!(params.conversation_id.to_string())
+    );
+    assert_eq!(
+        prepared_request.session_id_header,
+        Some(params.conversation_id.to_string())
+    );
+}
+
+/// Verifies that prompt cache keys stay stable across per-turn input changes within the same conversation.
+#[test]
+fn prepare_local_responses_request_keeps_prompt_cache_key_stable_for_same_conversation() {
+    let conversation_id = AIConversationId::new();
+    let mut params_a = request_params_for_local_backend_tests();
+    params_a.conversation_id = conversation_id;
+    params_a.local_openai_api_key = Some("test-key".to_string());
+    params_a.local_openai_base_url = Some("https://example.com".to_string());
+    params_a.input = vec![AIAgentInput::UserQuery {
+        query: "first question".to_string(),
+        context: std::sync::Arc::new([]),
+        static_query_type: None,
+        referenced_attachments: std::collections::HashMap::new(),
+        user_query_mode: crate::ai::agent::UserQueryMode::Normal,
+        running_command: None,
+        intended_agent: None,
+    }];
+
+    let mut params_b = request_params_for_local_backend_tests();
+    params_b.conversation_id = conversation_id;
+    params_b.local_openai_api_key = Some("test-key".to_string());
+    params_b.local_openai_base_url = Some("https://example.com".to_string());
+    params_b.input = vec![AIAgentInput::UserQuery {
+        query: "second question".to_string(),
+        context: std::sync::Arc::new([]),
+        static_query_type: None,
+        referenced_attachments: std::collections::HashMap::new(),
+        user_query_mode: crate::ai::agent::UserQueryMode::Normal,
+        running_command: None,
+        intended_agent: None,
+    }];
+
+    let prepared_a =
+        prepare_local_responses_request(&params_a).expect("first request should prepare");
+    let prepared_b =
+        prepare_local_responses_request(&params_b).expect("second request should prepare");
+
+    assert_eq!(
+        prepared_a.request_body.prompt_cache_key,
+        prepared_b.request_body.prompt_cache_key
+    );
+    assert_eq!(prepared_a.session_id_header, prepared_b.session_id_header);
+}
+
+/// Verifies that prompt cache keys change when Warp assigns a different conversation identity.
+#[test]
+fn prepare_local_responses_request_changes_prompt_cache_key_when_conversation_changes() {
+    let mut params_a = request_params_for_local_backend_tests();
+    params_a.local_openai_api_key = Some("test-key".to_string());
+    params_a.local_openai_base_url = Some("https://example.com".to_string());
+
+    let mut params_b = request_params_for_local_backend_tests();
+    params_b.local_openai_api_key = Some("test-key".to_string());
+    params_b.local_openai_base_url = Some("https://example.com".to_string());
+
+    let prepared_a =
+        prepare_local_responses_request(&params_a).expect("first request should prepare");
+    let prepared_b =
+        prepare_local_responses_request(&params_b).expect("second request should prepare");
+
+    assert_ne!(
+        prepared_a.request_body.prompt_cache_key,
+        prepared_b.request_body.prompt_cache_key
+    );
+    assert_ne!(prepared_a.session_id_header, prepared_b.session_id_header);
+}
+
+/// Verifies that the Session_id request header mirrors the prompt cache key exactly.
+#[test]
+fn prepare_local_responses_request_sets_session_id_header_from_prompt_cache_key() {
+    let mut params = request_params_for_local_backend_tests();
+    params.local_openai_api_key = Some("test-key".to_string());
+    params.local_openai_base_url = Some("https://example.com".to_string());
+
+    let prepared_request =
+        prepare_local_responses_request(&params).expect("request should prepare successfully");
+
+    assert_eq!(
+        prepared_request.session_id_header,
+        prepared_request.request_body.prompt_cache_key
+    );
 }
 
 /// Verifies that streaming text deltas update the existing agent output field.
@@ -625,6 +716,141 @@ fn finalize_stream_state_backfills_reasoning_messages_from_completed_output() {
         reasoning_item["encrypted_content"],
         serde_json::json!("enc_reasoning_payload")
     );
+    assert_eq!(
+        reasoning_item["summary"],
+        serde_json::json!([
+            {
+                "type": "summary_text",
+                "text": "Checked the repository wiring first."
+            }
+        ])
+    );
+    assert!(
+        reasoning_item.get("id").is_none(),
+        "replayed reasoning items should not send ids back"
+    );
+
+    conversation_state_store()
+        .lock()
+        .remove(&params.conversation_id);
+}
+
+/// Verifies that reasoning encrypted content captured from `output_item.done` survives even if `response.completed` omits the reasoning item.
+#[test]
+fn finalize_stream_state_preserves_reasoning_history_from_output_item_done() {
+    let params = request_params_for_local_backend_tests();
+    let task_id = TaskId::new("task-id".to_string());
+    conversation_state_store()
+        .lock()
+        .insert(params.conversation_id, LocalConversationState::default());
+    let mut accumulator = StreamingResponsesAccumulator::default();
+
+    let result = handle_responses_stream_message(
+        &params,
+        &task_id,
+        "request-id",
+        "response.output_item.done",
+        r#"{"item":{"id":"rs_stream_1","type":"reasoning","content":[],"summary":[{"type":"summary_text","text":"Need to keep this reasoning context."}],"encrypted_content":"enc_from_output_item_done"}}"#,
+        &mut accumulator,
+    )
+    .expect("reasoning output_item.done should parse");
+    assert_eq!(result.events.len(), 1);
+
+    finalize_stream_state(
+        &params,
+        accumulator,
+        "request-id",
+        Some(ResponsesApiResponse {
+            output: vec![ResponsesOutputItem {
+                id: Some("msg_1".to_string()),
+                item_type: "message".to_string(),
+                role: Some("assistant".to_string()),
+                content: vec![ResponsesContentItem {
+                    item_type: "output_text".to_string(),
+                    text: Some("Done".to_string()),
+                }],
+                summary: vec![],
+                encrypted_content: None,
+                name: None,
+                call_id: None,
+                arguments: None,
+            }],
+        }),
+    )
+    .expect("completed payload should finalize");
+
+    let stored_items = conversation_state_store()
+        .lock()
+        .get(&params.conversation_id)
+        .cloned()
+        .expect("conversation state should exist")
+        .items;
+    let reasoning_item = stored_items
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .expect("expected stored reasoning history item");
+    assert_eq!(
+        reasoning_item["encrypted_content"],
+        serde_json::json!("enc_from_output_item_done")
+    );
+    assert_eq!(
+        reasoning_item["summary"],
+        serde_json::json!([
+            {
+                "type": "summary_text",
+                "text": "Need to keep this reasoning context."
+            }
+        ])
+    );
+    assert!(
+        reasoning_item.get("id").is_none(),
+        "replayed reasoning items should not send ids back"
+    );
+
+    conversation_state_store()
+        .lock()
+        .remove(&params.conversation_id);
+}
+
+/// Verifies that replayed reasoning items preserve an explicit empty summary array.
+#[test]
+fn finalize_stream_state_preserves_empty_reasoning_summary_array() {
+    let params = request_params_for_local_backend_tests();
+    conversation_state_store()
+        .lock()
+        .insert(params.conversation_id, LocalConversationState::default());
+
+    finalize_stream_state(
+        &params,
+        StreamingResponsesAccumulator::default(),
+        "request-id",
+        Some(ResponsesApiResponse {
+            output: vec![ResponsesOutputItem {
+                id: Some("rs_empty_summary".to_string()),
+                item_type: "reasoning".to_string(),
+                role: None,
+                content: vec![],
+                summary: vec![],
+                encrypted_content: Some("enc_empty_summary".to_string()),
+                name: None,
+                call_id: None,
+                arguments: None,
+            }],
+        }),
+    )
+    .expect("completed payload should finalize");
+
+    let stored_items = conversation_state_store()
+        .lock()
+        .get(&params.conversation_id)
+        .cloned()
+        .expect("conversation state should exist")
+        .items;
+    let reasoning_item = stored_items
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .expect("expected stored reasoning history item");
+    assert_eq!(reasoning_item["summary"], serde_json::json!([]));
 
     conversation_state_store()
         .lock()
