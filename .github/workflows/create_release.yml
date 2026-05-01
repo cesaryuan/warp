@@ -238,21 +238,20 @@ jobs:
             GIT_BRANCH_NAME="${GIT_BRANCH_NAME#refs/heads/}"
             git fetch --tags origin
             SOURCE_COMMIT="$(git rev-parse "${GIT_BRANCH_NAME}^{commit}")"
-            EXISTING_TAG="$(
+            EXISTING_TAG_ON_COMMIT="$(
               git tag --points-at "$SOURCE_COMMIT" --sort=-version:refname \
                 | grep "\.${CHANNEL}_[0-9][0-9]$" \
-                | while read -r candidate; do
-                    if gh release view "$candidate" >/dev/null 2>&1; then
-                      echo "$candidate"
-                      break
-                    fi
-                  done
+                | head -n1 || true
             )"
+            EXISTING_RELEASE_FOR_TAG=false
+            if [[ -n "$EXISTING_TAG_ON_COMMIT" ]] && gh release view "$EXISTING_TAG_ON_COMMIT" >/dev/null 2>&1; then
+              EXISTING_RELEASE_FOR_TAG=true
+            fi
 
-            if [[ -n "$EXISTING_TAG" ]]; then
+            if [[ -n "$EXISTING_TAG_ON_COMMIT" ]]; then
               echo "branch=$GIT_BRANCH_NAME" >> $GITHUB_OUTPUT
-              echo "tag=$EXISTING_TAG" >> $GITHUB_OUTPUT
-              echo "reused_existing_release=true" >> $GITHUB_OUTPUT
+              echo "tag=$EXISTING_TAG_ON_COMMIT" >> $GITHUB_OUTPUT
+              echo "reused_existing_release=$EXISTING_RELEASE_FOR_TAG" >> $GITHUB_OUTPUT
             else
               source ./script/create_release_tag_and_branch --channel $CHANNEL --branch-name "$GIT_BRANCH_NAME"
               echo "branch=$(git branch --show-current)" >> $GITHUB_OUTPUT
