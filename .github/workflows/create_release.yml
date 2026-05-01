@@ -297,7 +297,7 @@ jobs:
     runs-on: ${{ inputs.runner_macos }}
     needs: prepare_release
     if: ${{ inputs.build_macos != false }}
-    timeout-minutes: 60
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:
@@ -435,7 +435,7 @@ jobs:
     runs-on: ${{ inputs.runner_macos }}
     needs: [prepare_release, release_macos_single_arch]
     if: ${{ inputs.build_macos != false }}
-    timeout-minutes: 60
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -588,7 +588,7 @@ jobs:
     runs-on: ${{ inputs.runner_macos }}
     needs: prepare_release
     if: ${{ inputs.build_macos != false }}
-    timeout-minutes: 60
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:
@@ -699,7 +699,7 @@ jobs:
     runs-on: ${{ inputs.runner_linux_x86 }}
     needs: prepare_release
     if: ${{ inputs.build_linux != false }}
-    timeout-minutes: 90
+    timeout-minutes: 100
     env:
       # Automatically extract AppImages before running them instead of mounting
       # them with FUSE, which isn't available on GitHub runners (and this is
@@ -865,7 +865,7 @@ jobs:
     runs-on: ${{ inputs.runner_linux_x86 }}
     needs: prepare_release
     if: ${{ inputs.build_linux != false }}
-    timeout-minutes: 90
+    timeout-minutes: 100
     env:
       # Cache the generated settings schema so prepare_bundled_resources only
       # compiles and runs the generator once per job instead of per-package.
@@ -1045,7 +1045,7 @@ jobs:
     runs-on: ${{ inputs.runner_linux_arm }}
     needs: prepare_release
     if: ${{ inputs.build_linux != false && inputs.build_linux_arm != false }}
-    timeout-minutes: 90
+    timeout-minutes: 100
     env:
       # Automatically extract AppImages before running them instead of mounting
       # them with FUSE, which isn't available on GitHub runners (and this is
@@ -1147,7 +1147,7 @@ jobs:
     runs-on: ${{ inputs.runner_linux_arm }}
     needs: prepare_release
     if: ${{ inputs.build_linux != false && inputs.build_linux_arm != false }}
-    timeout-minutes: 90
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -1225,7 +1225,7 @@ jobs:
     runs-on: ${{ inputs.runner_linux_x86 }}
     needs: [ prepare_release, build_linux_arm_binaries, build_linux_cli_arm_binaries ]
     if: ${{ inputs.build_linux != false && inputs.build_linux_arm != false }}
-    timeout-minutes: 60
+    timeout-minutes: 100
     env:
       # Cache the generated settings schema so prepare_bundled_resources only
       # compiles and runs the generator once per job instead of per-package.
@@ -1496,7 +1496,7 @@ jobs:
     runs-on: ${{ inputs.runner_web }}
     needs: prepare_release
     if: ${{ inputs.build_web != false }}
-    timeout-minutes: 60
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
