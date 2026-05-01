@@ -207,6 +207,8 @@ pub(super) struct StreamingResponsesAccumulator {
     pub(super) emitted_function_call_ids: Vec<String>,
     pub(super) web_search_states_by_item_id: HashMap<String, StreamingWebSearchState>,
     pub(super) emitted_web_search_item_ids: Vec<String>,
+    pub(super) replayable_history_items_by_key: HashMap<String, Value>,
+    pub(super) replayable_history_item_keys_in_order: Vec<String>,
 }
 
 impl Default for StreamingResponsesAccumulator {
@@ -224,6 +226,8 @@ impl Default for StreamingResponsesAccumulator {
             emitted_function_call_ids: Vec::new(),
             web_search_states_by_item_id: HashMap::new(),
             emitted_web_search_item_ids: Vec::new(),
+            replayable_history_items_by_key: HashMap::new(),
+            replayable_history_item_keys_in_order: Vec::new(),
         }
     }
 }

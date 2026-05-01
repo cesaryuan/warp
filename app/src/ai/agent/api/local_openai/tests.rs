@@ -1329,6 +1329,68 @@ fn finalize_stream_state_accepts_empty_completed_payload_after_streamed_text() {
         .remove(&params.conversation_id);
 }
 
+/// Verifies that streamed output-item completions are replayed even when `response.completed.output` is empty.
+#[test]
+fn finalize_stream_state_replays_streamed_output_items_when_completed_output_is_empty() {
+    let params = request_params_for_local_backend_tests();
+    let task_id = TaskId::new("task-id".to_string());
+    conversation_state_store()
+        .lock()
+        .insert(params.conversation_id, LocalConversationState::default());
+    let mut accumulator = StreamingResponsesAccumulator::default();
+
+    handle_responses_stream_message(
+        &params,
+        &task_id,
+        "request-id",
+        "response.output_item.done",
+        r#"{"item":{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"rust async","sources":[{"type":"url","url":"https://example.com/rust-async"}]}}}"#,
+        &mut accumulator,
+    )
+    .expect("web-search output item should parse");
+    handle_responses_stream_message(
+        &params,
+        &task_id,
+        "request-id",
+        "response.output_item.done",
+        r#"{"item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"Rust async overview","annotations":[{"type":"url_citation","url":"https://example.com/rust-async","title":"Rust Async Guide"}]}]}}"#,
+        &mut accumulator,
+    )
+    .expect("assistant output item should parse");
+
+    finalize_stream_state(
+        &params,
+        accumulator,
+        "request-id",
+        Some(ResponsesApiResponse { output: vec![] }),
+    )
+    .expect("empty completed payload should still preserve streamed output items");
+
+    let stored_items = conversation_state_store()
+        .lock()
+        .get(&params.conversation_id)
+        .cloned()
+        .expect("conversation state should exist")
+        .items;
+    assert_eq!(stored_items.len(), 2);
+    assert_eq!(stored_items[0]["type"], "web_search_call");
+    assert_eq!(stored_items[0]["status"], "completed");
+    assert_eq!(
+        stored_items[0]["action"]["sources"][0]["url"],
+        "https://example.com/rust-async"
+    );
+    assert_eq!(stored_items[1]["type"], "message");
+    assert_eq!(stored_items[1]["content"][0]["text"], "Rust async overview");
+    assert_eq!(
+        stored_items[1]["content"][0]["annotations"][0]["url"],
+        "https://example.com/rust-async"
+    );
+
+    conversation_state_store()
+        .lock()
+        .remove(&params.conversation_id);
+}
+
 /// Verifies that streamed function calls wait for output_item metadata when call_id is missing.
 #[test]
 fn streamed_function_calls_use_output_item_done_to_get_real_call_id() {
@@ -1655,7 +1717,10 @@ fn task_history_response_items_restore_prior_messages() {
                 id: "message-output".to_string(),
                 task_id: "task-id".to_string(),
                 server_message_data: String::new(),
-                citations: vec![],
+                citations: vec![api::Citation {
+                    document_id: "https://example.com/prior-answer".to_string(),
+                    document_type: api::DocumentType::WebPage as i32,
+                }],
                 request_id: "request-1".to_string(),
                 timestamp: None,
                 message: Some(api::message::Message::AgentOutput(
@@ -1663,6 +1728,27 @@ fn task_history_response_items_restore_prior_messages() {
                         text: "prior answer".to_string(),
                     },
                 )),
+            },
+            api::Message {
+                id: "message-web-search".to_string(),
+                task_id: "task-id".to_string(),
+                server_message_data: String::new(),
+                citations: vec![],
+                request_id: "request-1".to_string(),
+                timestamp: None,
+                message: Some(api::message::Message::WebSearch(api::message::WebSearch {
+                    status: Some(api::message::web_search::Status {
+                        r#type: Some(api::message::web_search::status::Type::Success(
+                            api::message::web_search::status::Success {
+                                query: "prior question".to_string(),
+                                pages: vec![api::message::web_search::status::success::SearchedPage {
+                                    url: "https://example.com/prior-answer".to_string(),
+                                    title: "Prior Answer".to_string(),
+                                }],
+                            },
+                        )),
+                    }),
+                })),
             },
         ],
         dependencies: None,
@@ -1672,7 +1758,7 @@ fn task_history_response_items_restore_prior_messages() {
     }];
 
     let items = task_history_response_items(&params).expect("task history should convert");
-    assert_eq!(items.len(), 4);
+    assert_eq!(items.len(), 5);
     assert_eq!(items[0]["role"], "user");
     assert_eq!(items[1]["type"], "function_call");
     assert_eq!(items[1]["name"], "read_files");
@@ -1680,6 +1766,17 @@ fn task_history_response_items_restore_prior_messages() {
     assert_eq!(items[2]["call_id"], "call_1");
     assert_eq!(items[3]["role"], "assistant");
     assert_eq!(items[3]["content"][0]["text"], "prior answer");
+    assert_eq!(
+        items[3]["content"][0]["annotations"][0]["url"],
+        "https://example.com/prior-answer"
+    );
+    assert_eq!(items[4]["type"], "web_search_call");
+    assert_eq!(items[4]["status"], "completed");
+    assert_eq!(items[4]["action"]["query"], "prior question");
+    assert_eq!(
+        items[4]["action"]["sources"][0]["url"],
+        "https://example.com/prior-answer"
+    );
 }
 
 /// Verifies that transient provider status codes are retried by the local backend.

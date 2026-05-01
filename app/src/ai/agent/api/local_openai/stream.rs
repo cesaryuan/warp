@@ -10,7 +10,10 @@ use warp_multi_agent_api as api;
 
 use crate::ai::agent::task::TaskId;
 
-use super::request::{assistant_output_item, function_call_history_item, reasoning_history_item};
+use super::request::{
+    assistant_output_item, assistant_output_item_with_annotations, function_call_history_item,
+    reasoning_history_item, web_search_call_history_item,
+};
 use super::tool_calls::parse_tool_call;
 use super::types::{
     ParsedFunctionCall, ResponsesApiResponse, ResponsesCompletedEvent,
@@ -569,11 +572,18 @@ fn maybe_emit_streamed_function_call(
             .push(function_call_id.to_string());
     }
 
-    Ok(Some(ParsedFunctionCall {
+    let function_call = ParsedFunctionCall {
         name,
         call_id: canonical_call_id,
         arguments,
-    }))
+    };
+    record_replayable_history_item(
+        accumulator,
+        format!("function_call:{function_call_id}"),
+        function_call_history_item(&function_call),
+    );
+
+    Ok(Some(function_call))
 }
 
 /// Reconciles a streamed function call state key, promoting item_id-backed state to a real call_id when available.
@@ -701,22 +711,42 @@ fn has_streamed_output(accumulator: &StreamingResponsesAccumulator) -> bool {
         || !accumulator.emitted_reasoning_keys.is_empty()
         || !accumulator.emitted_function_call_ids.is_empty()
         || !accumulator.emitted_web_search_item_ids.is_empty()
+        || !accumulator.replayable_history_item_keys_in_order.is_empty()
 }
 
 /// Reconstructs conversation history items from streamed deltas when the completed payload is empty.
 fn history_items_from_accumulator(
     accumulator: &StreamingResponsesAccumulator,
 ) -> anyhow::Result<Vec<Value>> {
-    let mut items = Vec::new();
+    let mut items = accumulator
+        .replayable_history_item_keys_in_order
+        .iter()
+        .filter_map(|key| accumulator.replayable_history_items_by_key.get(key).cloned())
+        .collect::<Vec<_>>();
 
     for key in &accumulator.reasoning_history_item_keys_in_order {
         let Some(reasoning_item) = accumulator.reasoning_history_items_by_key.get(key) else {
             continue;
         };
+        let replayable_key = key
+            .strip_prefix("reasoning_history:")
+            .map(|suffix| format!("reasoning:{suffix}"));
+        if replayable_key
+            .as_ref()
+            .is_some_and(|replayable_key| accumulator.replayable_history_items_by_key.contains_key(replayable_key))
+        {
+            continue;
+        }
         items.push(reasoning_item.clone());
     }
 
     for item_id in &accumulator.emitted_text_item_ids {
+        if accumulator
+            .replayable_history_items_by_key
+            .contains_key(&format!("message:{item_id}"))
+        {
+            continue;
+        }
         let Some(message_state) = accumulator.text_messages_by_item_id.get(item_id) else {
             continue;
         };
@@ -726,6 +756,12 @@ fn history_items_from_accumulator(
     }
 
     for call_id in &accumulator.emitted_function_call_ids {
+        if accumulator
+            .replayable_history_items_by_key
+            .contains_key(&format!("function_call:{call_id}"))
+        {
+            continue;
+        }
         let Some(function_call_state) = accumulator.function_calls_by_call_id.get(call_id) else {
             continue;
         };
@@ -755,19 +791,13 @@ fn history_items_from_completed_output(
 ) -> anyhow::Result<Vec<Value>> {
     let mut history_items = Vec::new();
     let mut recorded_reasoning_keys = std::collections::HashSet::new();
+    let citation_titles_by_url = citation_titles_by_url(&output);
 
     for item in output {
         match item.item_type.as_str() {
             "message" if item.role.as_deref() == Some("assistant") => {
-                let text = item
-                    .content
-                    .iter()
-                    .filter(|content| matches!(content.item_type.as_str(), "output_text" | "text"))
-                    .filter_map(|content| content.text.clone())
-                    .collect::<Vec<_>>()
-                    .join("");
-                if !text.is_empty() {
-                    history_items.push(assistant_output_item(&text));
+                if let Some(history_item) = assistant_history_item_from_output_item(&item) {
+                    history_items.push(history_item);
                 }
             }
             "reasoning" => {
@@ -796,6 +826,13 @@ fn history_items_from_completed_output(
                     call_id,
                     arguments,
                 }));
+            }
+            "web_search_call" => {
+                if let Some(history_item) =
+                    web_search_history_item_from_output_item(&item, &citation_titles_by_url)
+                {
+                    history_items.push(history_item);
+                }
             }
             _ => {}
         }
@@ -1009,6 +1046,13 @@ fn handle_streamed_assistant_output_item_done(
     {
         accumulator.finalized_text_item_ids.push(item_id.clone());
     }
+    if let Some(history_item) = assistant_history_item_from_output_item(item) {
+        record_replayable_history_item(
+            accumulator,
+            format!("message:{item_id}"),
+            history_item,
+        );
+    }
 
     if had_existing_state {
         return Ok(Some(update_agent_output_message_event(
@@ -1055,6 +1099,13 @@ fn handle_streamed_web_search_output_item_done(
         return None;
     };
     let status = web_search_status_from_output_item(item, &HashMap::new())?;
+    if let Some(history_item) = web_search_history_item_from_output_item(item, &HashMap::new()) {
+        record_replayable_history_item(
+            accumulator,
+            format!("web_search_call:{item_id}"),
+            history_item,
+        );
+    }
 
     if let Some(existing_state) = accumulator.web_search_states_by_item_id.get(item_id) {
         if !accumulator
@@ -1106,6 +1157,27 @@ fn assistant_message_text(item: &ResponsesOutputItem) -> String {
         .filter_map(|content| content.text.clone())
         .collect::<Vec<_>>()
         .join("")
+}
+
+/// Converts a completed assistant output item into a replayable Responses history item.
+fn assistant_history_item_from_output_item(item: &ResponsesOutputItem) -> Option<Value> {
+    let text = assistant_message_text(item);
+    if text.is_empty() {
+        return None;
+    }
+
+    let annotations = item
+        .content
+        .iter()
+        .flat_map(|content| {
+            content
+                .annotations
+                .iter()
+                .filter_map(output_text_annotation_history_value)
+        })
+        .collect::<Vec<_>>();
+
+    Some(assistant_output_item_with_annotations(&text, annotations))
 }
 
 /// Extracts deduplicated webpage citations from a Responses assistant message output item.
@@ -1170,6 +1242,30 @@ fn web_search_message_from_output_item(
         task_id,
         request_id,
         status,
+    ))
+}
+
+/// Converts a completed web-search output item into a replayable Responses history item.
+fn web_search_history_item_from_output_item(
+    item: &ResponsesOutputItem,
+    citation_titles_by_url: &HashMap<String, String>,
+) -> Option<Value> {
+    if item.item_type != "web_search_call" {
+        return None;
+    }
+
+    let query = web_search_query_from_action(item.action.as_ref());
+    let status = match item.status.as_deref() {
+        Some("in_progress") | Some("searching") => "searching",
+        Some("failed") => "failed",
+        Some("completed") | Some(_) | None => "completed",
+    };
+    let pages = web_search_pages_from_item(item, citation_titles_by_url);
+
+    Some(web_search_call_history_item(
+        query.as_deref(),
+        status,
+        &pages,
     ))
 }
 
@@ -1284,6 +1380,18 @@ fn output_text_annotation_as_web_page(
     Some((url, title))
 }
 
+/// Converts a Responses output-text annotation back into a replayable raw annotation payload.
+fn output_text_annotation_history_value(annotation: &ResponsesOutputTextAnnotation) -> Option<Value> {
+    let (url, title) = output_text_annotation_as_web_page(annotation)?;
+    let mut value = serde_json::Map::new();
+    value.insert("type".to_string(), Value::String("url_citation".to_string()));
+    value.insert("url".to_string(), Value::String(url));
+    if !title.is_empty() {
+        value.insert("title".to_string(), Value::String(title));
+    }
+    Some(Value::Object(value))
+}
+
 /// Builds reasoning messages from a completed reasoning output item that was not streamed incrementally.
 fn reasoning_messages_from_output_item(
     task_id: &TaskId,
@@ -1318,6 +1426,20 @@ fn reasoning_messages_from_output_item(
         .collect()
 }
 
+/// Records a replayable history item in stream order so empty `response.completed.output` can still be replayed faithfully.
+fn record_replayable_history_item(
+    accumulator: &mut StreamingResponsesAccumulator,
+    key: String,
+    item: Value,
+) {
+    if !accumulator.replayable_history_items_by_key.contains_key(&key) {
+        accumulator
+            .replayable_history_item_keys_in_order
+            .push(key.clone());
+    }
+    accumulator.replayable_history_items_by_key.insert(key, item);
+}
+
 /// Records a replayable reasoning history item from streaming metadata so stateless follow-ups keep encrypted context.
 fn record_reasoning_history_item(
     accumulator: &mut StreamingResponsesAccumulator,
@@ -1341,6 +1463,16 @@ fn record_reasoning_history_item(
     accumulator
         .reasoning_history_items_by_key
         .insert(key, reasoning_item);
+
+    if let Some(item_id) = item.id.as_ref().filter(|item_id| !item_id.is_empty()) {
+        if let Some(reasoning_item) = reasoning_history_item(item) {
+            record_replayable_history_item(
+                accumulator,
+                format!("reasoning:{item_id}"),
+                reasoning_item,
+            );
+        }
+    }
 }
 
 /// Extracts the reasoning texts Warp should render from a Responses reasoning output item.
