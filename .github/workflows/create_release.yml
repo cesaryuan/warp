@@ -199,6 +199,7 @@ jobs:
       release_branch: ${{ steps.create_branch_and_tag.outputs.branch }}
       release_tag: ${{ steps.create_branch_and_tag.outputs.tag }}
       should_publish: ${{ steps.set_publish.outputs.should_publish }}
+      reused_existing_release: ${{ steps.create_branch_and_tag.outputs.reused_existing_release }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -235,20 +236,42 @@ jobs:
               GIT_BRANCH_NAME="${GITHUB_REF}"
             fi
             GIT_BRANCH_NAME="${GIT_BRANCH_NAME#refs/heads/}"
-            source ./script/create_release_tag_and_branch --channel $CHANNEL --branch-name "$GIT_BRANCH_NAME"
-            echo "branch=$(git branch --show-current)" >> $GITHUB_OUTPUT
-            echo "tag=$tag" >> $GITHUB_OUTPUT
+            git fetch --tags origin
+            SOURCE_COMMIT="$(git rev-parse "${GIT_BRANCH_NAME}^{commit}")"
+            EXISTING_TAG="$(
+              git tag --points-at "$SOURCE_COMMIT" --sort=-version:refname \
+                | grep "\.${CHANNEL}_[0-9][0-9]$" \
+                | while read -r candidate; do
+                    if gh release view "$candidate" >/dev/null 2>&1; then
+                      echo "$candidate"
+                      break
+                    fi
+                  done
+            )"
+
+            if [[ -n "$EXISTING_TAG" ]]; then
+              echo "branch=$GIT_BRANCH_NAME" >> $GITHUB_OUTPUT
+              echo "tag=$EXISTING_TAG" >> $GITHUB_OUTPUT
+              echo "reused_existing_release=true" >> $GITHUB_OUTPUT
+            else
+              source ./script/create_release_tag_and_branch --channel $CHANNEL --branch-name "$GIT_BRANCH_NAME"
+              echo "branch=$(git branch --show-current)" >> $GITHUB_OUTPUT
+              echo "tag=$tag" >> $GITHUB_OUTPUT
+              echo "reused_existing_release=false" >> $GITHUB_OUTPUT
+            fi
           else
             echo "branch=$(git branch --show-current)" >> $GITHUB_OUTPUT
             # Use a fake version tag that will pass package validation.
             echo "tag=v0.$GITHUB_SHA" >> $GITHUB_OUTPUT
+            echo "reused_existing_release=false" >> $GITHUB_OUTPUT
           fi
         shell: bash
         env:
           CHANNEL: ${{ steps.get-config.outputs.channel }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create GitHub release
-        if: ${{ steps.set_publish.outputs.should_publish == 'true' }}
+        if: ${{ steps.set_publish.outputs.should_publish == 'true' && steps.create_branch_and_tag.outputs.reused_existing_release != 'true' }}
         id: create_release
         uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
         with:
@@ -347,6 +370,7 @@ jobs:
         with:
           tag_name: ${{ needs.prepare_release.outputs.release_tag }}
           files: ${{ steps.bundle_app.outputs.dmg_path }}
+          overwrite_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
@@ -509,6 +533,7 @@ jobs:
         with:
           tag_name: ${{ needs.prepare_release.outputs.release_tag }}
           files: ${{ steps.bundle_app.outputs.dmg_path }}
+          overwrite_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Add DMG to GitHub release assets (retry 1/2)
@@ -521,6 +546,7 @@ jobs:
         with:
           tag_name: ${{ needs.prepare_release.outputs.release_tag }}
           files: ${{ steps.bundle_app.outputs.dmg_path }}
+          overwrite_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Add DMG to GitHub release assets (retry 2/2)
@@ -531,6 +557,7 @@ jobs:
         with:
           tag_name: ${{ needs.prepare_release.outputs.release_tag }}
           files: ${{ steps.bundle_app.outputs.dmg_path }}
+          overwrite_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
@@ -628,6 +655,7 @@ jobs:
         with:
           tag_name: ${{ needs.prepare_release.outputs.release_tag }}
           files: oz-${{ steps.get-config.outputs.channel }}-macos-${{ matrix.arch }}.tar.gz
+          overwrite_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
@@ -805,6 +833,7 @@ jobs:
         with:
           tag_name: ${{ needs.prepare_release.outputs.release_tag }}
           files: ${{ steps.bundle_app.outputs.packages_dir }}/*
+          overwrite_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload packages to Google Cloud Storage
@@ -960,6 +989,7 @@ jobs:
         with:
           tag_name: ${{ needs.prepare_release.outputs.release_tag }}
           files: ${{ steps.bundle_cli.outputs.packages_dir }}/*
+          overwrite_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload CLI packages to Google Cloud Storage
@@ -983,6 +1013,7 @@ jobs:
         with:
           tag_name: ${{ needs.prepare_release.outputs.release_tag }}
           files: oz-${{ steps.get-config.outputs.channel }}-linux-x86_64.tar.gz
+          overwrite_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload CLI tar.gz to Google Cloud Storage
@@ -1382,6 +1413,7 @@ jobs:
         with:
           tag_name: ${{ needs.prepare_release.outputs.release_tag }}
           files: ${{ steps.bundle_app.outputs.packages_dir }}/*
+          overwrite_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Add CLI packages to GitHub release assets
@@ -1390,6 +1422,7 @@ jobs:
         with:
           tag_name: ${{ needs.prepare_release.outputs.release_tag }}
           files: ${{ steps.bundle_cli.outputs.packages_dir }}/*
+          overwrite_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Add CLI tar.gz to GitHub release assets
@@ -1398,6 +1431,7 @@ jobs:
         with:
           tag_name: ${{ needs.prepare_release.outputs.release_tag }}
           files: oz-${{ steps.get-config.outputs.channel }}-linux-aarch64.tar.gz
+          overwrite_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload app packages to Google Cloud Storage
@@ -1509,6 +1543,7 @@ jobs:
         with:
           tag_name: ${{ needs.prepare_release.outputs.release_tag }}
           files: ${{ steps.bundle_app.outputs.packages_dir }}/*
+          overwrite_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
@@ -1703,6 +1738,7 @@ jobs:
         with:
           tag_name: ${{ needs.prepare_release.outputs.release_tag }}
           files: ${{ steps.bundle_app.outputs.installer_path }}
+          overwrite_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
