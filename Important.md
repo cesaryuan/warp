@@ -27,3 +27,33 @@
 本地如果要产出和 `.github/workflows/release_master_from_upstream_stable.yml` 那条 OSS release 流程同类型的 Windows 安装包，不要直接猜 `cargo bundle` 或手搓 `ISCC` 参数，优先走 `script/windows/bundle.ps1 -Channel oss -Arch x64`。这条链路和 CI 对齐，最终产物名就是 `script/windows/Output/WarpOssSetup.exe`。
 
 CI 的 Windows release 实际是两段式调用同一个脚本：先 `-SkipBuildInstaller` 编二进制，再 `-SkipBuildBinary` 组装 installer；但本地如果只是想拿到可安装的 `WarpOssSetup.exe`，单次运行 `bundle.ps1` 就够了。是否签名不是这条 OSS 本地构建的重点，默认不签名也和当前 OSS release workflow 保持一致。
+
+# Local OpenAI Responses API 约定
+
+本地 `local_openai` 后端要显示 Warp 里的 thinking / `Thought for N seconds`，关键不是“拿到最终 answer”就够了，而是要主动请求并解析 reasoning 流。请求侧对 reasoning 模型补 `reasoning.summary = "auto"`，流式侧同时接 `response.reasoning_summary_text.*`、兼容 `response.reasoning_text.*`，并把完成时长落到 Warp 的 `AgentReasoning`，这样 UI 才能稳定显示思考过程和耗时。
+
+`encrypted_content` 不是可有可无的附带字段；在 `store: false` 的本地手动回放模式里，它是多轮 reasoning / tool use 续上下文的关键。请求里要带 `include: ["reasoning.encrypted_content"]`，回放时要把 `reasoning` item 连同 `encrypted_content` 一起传回去，而且不要回传 `id`；`summary` 即使是空数组 `[]` 也不能省略。
+
+不要只信 `response.completed.output`。实际 provider 可能会在 SSE 的 `response.output_item.done` 里给出 reasoning 和 `encrypted_content`，但在最终 completed 里漏掉它；如果只在 completed 阶段建 history，下一轮就会丢推理上下文。更稳妥的做法是流式阶段先按顺序缓存 replayable history，再在 finalize 时和 completed 输出合并。
+
+`prompt_cache_key` 在这条链路里更适合直接用 Warp 自己的 `conversation_id` 字符串，而不是根据 prompt 内容再算一层 hash。除此之外，后面确认过真正让缓存更稳定命中的关键，是把同样的值再放进请求头 `Session_id`；只在 body 里带 `prompt_cache_key`，命中率未必稳定。
+
+如果怀疑 `local_openai` 里有“只剩测试在用”的死函数，不要只搜 `foo(` 这种直接调用。这个目录里有些 helper 会以 `map(foo)`、`filter_map(foo)`、`or_insert_with(foo)` 这类函数指针形式出现在生产代码里，先做目录级引用检查，再决定删不删。
+
+Windows 上跑 `cargo test local_openai --lib` 时，如果卡住或异常，不一定是这块逻辑坏了。这个仓库的 `app/build.rs` 可能会因为 `target/debug/conpty.dll` 被占用而失败或超时；遇到这种情况，先排查是否有正在运行的 Warp 开发实例或别的进程锁住了这个文件。
+
+本地 `local_openai` 这条路的定位一直是“本地 provider 调用 + `ResponseEvent` 兼容层”，不是把 Warp 现有的工具执行 loop 整套搬出来重写。也就是说，尽量复用 Warp 自己的 `ClientActions -> tool_call_result -> 下一轮请求` 链路；只有在必须和 OpenAI Responses 协议对接的边界处，才自己做适配。
+
+本地新会话第一轮一定要先发 `CreateTask`，再发后续消息；如果直接上 `AddMessagesToTask`，Warp 侧会报 `TaskNotInitialized / Task not found / Exchange not found`，UI 还会一直停在 `warping`。以后如果再看到“回答似乎出来了，但状态死活不结束”，先检查事件顺序，不要先怀疑模型或网络。
+
+Responses 的流式事件解析要以 OpenAI 官方文档为基线，但实现上必须对 `OpenAI-compatible` 后端保持宽容。像 `call_id`、`name`、甚至部分最终 output item，兼容后端可能不会在第一条事件里就给全；缺字段时优先缓冲状态，等 `response.output_item.done` 或 `response.completed` 补齐，而不是立刻把整条流打成内部错误。
+
+`response.completed.output` 不能当成唯一真相。实际接入里，assistant 文本、tool call 元数据、reasoning 甚至 web search 相关 item，都可能只在 SSE 过程中完整出现；`completed` 更适合作为兜底和收尾，而不是唯一数据源。以后如果“前面都正常，最后突然报 internal error”，优先排查 finalize 阶段是不是对 completed 过度乐观。
+
+Warp 原项目对 built-in tools 没有现成的 OpenAI function schema 存储，后续 agent 不要再去找一个并不存在的“官方 schema 表”。built-in schema 需要从 `ToolType`、`task.proto`、以及 action/convert 逻辑推出来；反过来，MCP tools 是有现成 `description + input_schema` 的，这部分应该直接复用，不要手写一份平替。
+
+`strict` 不能默认全开。只要一个 tool schema 里存在可选字段，或者嵌套 object 的 `required` 不能覆盖全部 `properties`，OpenAI 的严格校验就可能直接拒绝这条 tool 定义；当前约定是：确实满足 strict 约束的 built-in tool 才开 `strict: true`，有可选字段的工具宁可关掉 strict，也不要为了“看起来更规范”把请求直接打挂。
+
+`app/src/ai/agent/api/local_openai/tool_schemas.rs` 里的 built-in tool schema 需要优先向 Warp 官方实际产出的 function schema 靠拢，而不是只围着本地 proto 旧字段打转。这次已经把 `run_shell_command`、`read_files`、`file_glob`、`read_skill` 等描述和参数形状往官方口径收拢，同时在 `tool_calls.rs` / `request.rs` 保留了必要的兼容解析与序列化；以后再改这块，尽量成套同步 schema、parse、serialize，不要只改一边。
+
+`local_openai` 里的 built-in schema 不能为了“向官方名字看齐”就随便引入 alias tool 名。当前约定是：如果仓库里没有同名本地 tool，就不要在 `tool_schemas.rs` 里硬加一个官方别名；对于功能相近但名字不同的本地 tool，只参考官方 schema 去完善字段说明和参数约束，不额外扩一层 alias 映射，避免平白增加上下文和维护面。
