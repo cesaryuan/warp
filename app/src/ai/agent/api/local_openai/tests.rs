@@ -51,6 +51,7 @@ fn request_params_for_local_backend_tests() -> RequestParams {
         computer_use_model: model,
         is_memory_enabled: false,
         warp_drive_context_enabled: false,
+        context_window_limit: None,
         mcp_context: None,
         planning_enabled: true,
         should_redact_secrets: false,
