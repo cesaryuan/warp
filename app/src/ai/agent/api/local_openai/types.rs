@@ -42,6 +42,10 @@ pub(super) struct ResponsesOutputItem {
     pub(super) call_id: Option<String>,
     #[serde(default)]
     pub(super) arguments: Option<String>,
+    #[serde(default)]
+    pub(super) status: Option<String>,
+    #[serde(default)]
+    pub(super) action: Option<ResponsesWebSearchAction>,
 }
 
 /// Parsed subset of a message content item returned by Responses.
@@ -51,6 +55,32 @@ pub(super) struct ResponsesContentItem {
     pub(super) item_type: String,
     #[serde(default)]
     pub(super) text: Option<String>,
+    #[serde(default)]
+    pub(super) annotations: Vec<ResponsesOutputTextAnnotation>,
+}
+
+/// Parsed subset of an `output_text` citation annotation returned by Responses.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ResponsesOutputTextAnnotation {
+    #[serde(rename = "type", default)]
+    pub(super) item_type: String,
+    #[serde(default)]
+    pub(super) url: Option<String>,
+    #[serde(default)]
+    pub(super) title: Option<String>,
+    #[serde(default)]
+    pub(super) url_citation: Option<ResponsesNestedUrlCitation>,
+}
+
+/// Parsed subset of a nested `url_citation` payload used by some compatible providers.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ResponsesNestedUrlCitation {
+    #[serde(rename = "type", default)]
+    pub(super) item_type: String,
+    #[serde(default)]
+    pub(super) url: Option<String>,
+    #[serde(default)]
+    pub(super) title: Option<String>,
 }
 
 /// Parsed subset of a reasoning summary part returned by Responses.
@@ -60,6 +90,26 @@ pub(super) struct ResponsesReasoningSummaryPart {
     pub(super) item_type: String,
     #[serde(default)]
     pub(super) text: Option<String>,
+}
+
+/// Parsed subset of a `web_search_call` action returned by Responses.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ResponsesWebSearchAction {
+    #[serde(rename = "type", default)]
+    pub(super) action_type: String,
+    #[serde(default)]
+    pub(super) query: Option<String>,
+    #[serde(default)]
+    pub(super) sources: Vec<ResponsesWebSearchSource>,
+}
+
+/// Parsed subset of a single web-search source returned by Responses when included explicitly.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ResponsesWebSearchSource {
+    #[serde(rename = "type", default)]
+    pub(super) source_type: String,
+    #[serde(default)]
+    pub(super) url: Option<String>,
 }
 
 /// Generic error envelope returned by OpenAI-compatible APIs.

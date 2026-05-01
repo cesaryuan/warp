@@ -695,6 +695,7 @@ fn user_visible_error_event(
             task_id,
             request_id,
             format!("Local OpenAI backend error: {error_message}"),
+            vec![],
         )],
     )
 }

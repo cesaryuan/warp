@@ -67,7 +67,7 @@ pub(super) fn prepare_local_responses_request(
             normalize_openai_model_and_reasoning(&params.model.to_string());
         let instructions = build_local_openai_system_prompt(&normalized_model);
         let tools = build_tools_payload(params);
-        let include = responses_include_fields();
+        let include = responses_include_fields(params);
         let prompt_cache_key = build_prompt_cache_key(params);
         ResponsesRequestBody {
             instructions,
@@ -94,8 +94,12 @@ pub(super) fn prepare_local_responses_request(
 }
 
 /// Returns the extra Responses fields Warp needs preserved across stateless turns.
-fn responses_include_fields() -> Vec<String> {
-    vec!["reasoning.encrypted_content".to_string()]
+fn responses_include_fields(params: &RequestParams) -> Vec<String> {
+    let mut include = vec!["reasoning.encrypted_content".to_string()];
+    if params.web_search_enabled {
+        include.push("web_search_call.action.sources".to_string());
+    }
+    include
 }
 
 /// Builds a stable prompt cache key from Warp's conversation identity so repeated turns reuse the same cache route.
@@ -507,6 +511,11 @@ pub(super) fn build_tools_payload(params: &RequestParams) -> Vec<Value> {
         .into_iter()
         .filter_map(built_in_tool_schema)
         .collect::<Vec<_>>();
+    if params.web_search_enabled {
+        tools.push(json!({
+            "type": "web_search"
+        }));
+    }
     if supports_mcp_tools {
         tools.extend(mcp_tool_schemas(params.mcp_context.as_ref()));
     }

@@ -1,5 +1,6 @@
 //! Streaming response handling for the local OpenAI-compatible Responses backend.
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context as _};
@@ -14,10 +15,11 @@ use super::tool_calls::parse_tool_call;
 use super::types::{
     ParsedFunctionCall, ResponsesApiResponse, ResponsesCompletedEvent,
     ResponsesFunctionCallArgumentsDeltaEvent, ResponsesFunctionCallArgumentsDoneEvent,
-    ResponsesOutputItem, ResponsesOutputItemDoneEvent, ResponsesReasoningPartAddedEvent,
-    ResponsesReasoningTextDeltaEvent, ResponsesReasoningTextDoneEvent, ResponsesTextDeltaEvent,
-    StreamMessageResult, StreamingFunctionCallState, StreamingReasoningMessageState,
-    StreamingResponsesAccumulator, StreamingTextMessageState,
+    ResponsesOutputItem, ResponsesOutputItemDoneEvent, ResponsesOutputTextAnnotation,
+    ResponsesReasoningPartAddedEvent, ResponsesReasoningTextDeltaEvent,
+    ResponsesReasoningTextDoneEvent, ResponsesTextDeltaEvent, ResponsesWebSearchAction,
+    StreamMessageResult, StreamingFunctionCallState,
+    StreamingReasoningMessageState, StreamingResponsesAccumulator, StreamingTextMessageState,
 };
 use super::{
     add_messages_event, conversation_state_store, finished_reason_for_error, stream_finished_event,
@@ -243,6 +245,7 @@ fn handle_streamed_text_delta(
             task_id,
             request_id,
             delta_event.delta,
+            vec![],
         )],
     )))
 }
@@ -583,12 +586,17 @@ pub(super) fn finalize_stream_state(
             &accumulator,
             params.target_task_id.as_ref(),
             request_id,
-            output,
+            &output,
         )?;
         if let Some(task_id) = params.target_task_id.as_ref() {
             if !backfill_messages.is_empty() {
                 events.push(Ok(add_messages_event(task_id, backfill_messages)));
             }
+            events.extend(
+                build_streamed_message_citation_updates(&accumulator, task_id, request_id, &output)
+                    .into_iter()
+                    .map(Ok),
+            );
         }
     }
 
@@ -723,13 +731,14 @@ fn build_backfill_messages(
     accumulator: &StreamingResponsesAccumulator,
     task_id: Option<&TaskId>,
     request_id: &str,
-    output: Vec<ResponsesOutputItem>,
+    output: &[ResponsesOutputItem],
 ) -> anyhow::Result<Vec<api::Message>> {
     let Some(task_id) = task_id else {
         return Ok(Vec::new());
     };
 
     let mut messages = Vec::new();
+    let citation_titles_by_url = citation_titles_by_url(output);
     for item in output {
         match item.item_type.as_str() {
             "message" if item.role.as_deref() == Some("assistant") => {
@@ -744,14 +753,15 @@ fn build_backfill_messages(
                     continue;
                 }
 
-                let text = item
-                    .content
-                    .iter()
-                    .filter(|content| content.item_type == "output_text")
-                    .filter_map(|content| content.text.clone())
-                    .collect::<String>();
+                let text = assistant_message_text(item);
+                let citations = citations_from_output_item(item);
                 if !text.is_empty() {
-                    messages.push(agent_output_message(task_id, request_id, text));
+                    messages.push(agent_output_message(
+                        task_id,
+                        request_id,
+                        text,
+                        citations,
+                    ));
                 }
             }
             "reasoning" => {
@@ -777,7 +787,7 @@ fn build_backfill_messages(
                 let Some(name) = item.name.clone() else {
                     continue;
                 };
-                let arguments = item.arguments.unwrap_or_else(|| "{}".to_string());
+                let arguments = item.arguments.clone().unwrap_or_else(|| "{}".to_string());
                 messages.push(tool_call_message(
                     task_id,
                     request_id,
@@ -789,11 +799,235 @@ fn build_backfill_messages(
                     },
                 )?);
             }
+            "web_search_call" => {
+                if let Some(message) =
+                    web_search_message_from_output_item(task_id, request_id, item, &citation_titles_by_url)
+                {
+                    messages.push(message);
+                }
+            }
             _ => {}
         }
     }
 
     Ok(messages)
+}
+
+/// Builds update events that attach web citations to assistant messages already streamed via text deltas.
+fn build_streamed_message_citation_updates(
+    accumulator: &StreamingResponsesAccumulator,
+    task_id: &TaskId,
+    request_id: &str,
+    output: &[ResponsesOutputItem],
+) -> Vec<api::ResponseEvent> {
+    output
+        .iter()
+        .filter(|item| item.item_type == "message" && item.role.as_deref() == Some("assistant"))
+        .filter_map(|item| {
+            let item_id = item.id.as_ref()?;
+            let message_state = accumulator.text_messages_by_item_id.get(item_id)?;
+            let citations = citations_from_output_item(item);
+            if citations.is_empty() {
+                return None;
+            }
+
+            Some(update_agent_output_citations_event(
+                task_id,
+                request_id,
+                &message_state.message_id,
+                message_state.text.clone(),
+                citations,
+            ))
+        })
+        .collect()
+}
+
+/// Extracts the user-visible assistant text from a Responses assistant message output item.
+fn assistant_message_text(item: &ResponsesOutputItem) -> String {
+    item.content
+        .iter()
+        .filter(|content| matches!(content.item_type.as_str(), "output_text" | "text"))
+        .filter_map(|content| content.text.clone())
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Extracts deduplicated webpage citations from a Responses assistant message output item.
+fn citations_from_output_item(item: &ResponsesOutputItem) -> Vec<api::Citation> {
+    let mut seen_urls = HashSet::new();
+    let mut citations = Vec::new();
+
+    for content in &item.content {
+        for annotation in &content.annotations {
+            let Some((url, _title)) = output_text_annotation_as_web_page(annotation) else {
+                continue;
+            };
+            if !seen_urls.insert(url.clone()) {
+                continue;
+            }
+            citations.push(api::Citation {
+                document_id: url,
+                document_type: api::DocumentType::WebPage.into(),
+            });
+        }
+    }
+
+    citations
+}
+
+/// Builds a URL-to-title map from all assistant-message citations in the completed Responses output.
+fn citation_titles_by_url(output: &[ResponsesOutputItem]) -> HashMap<String, String> {
+    let mut titles = HashMap::new();
+    for item in output {
+        if item.item_type != "message" || item.role.as_deref() != Some("assistant") {
+            continue;
+        }
+        for content in &item.content {
+            for annotation in &content.annotations {
+                let Some((url, title)) = output_text_annotation_as_web_page(annotation) else {
+                    continue;
+                };
+                if !url.is_empty() {
+                    titles.entry(url).or_insert(title);
+                }
+            }
+        }
+    }
+    titles
+}
+
+/// Converts a completed `web_search_call` item into Warp's status message.
+fn web_search_message_from_output_item(
+    task_id: &TaskId,
+    request_id: &str,
+    item: &ResponsesOutputItem,
+    citation_titles_by_url: &HashMap<String, String>,
+) -> Option<api::Message> {
+    if item.item_type != "web_search_call" {
+        return None;
+    }
+
+    let query = web_search_query_from_action(item.action.as_ref()).unwrap_or_default();
+    let pages = web_search_pages_from_item(item, citation_titles_by_url);
+    let status = match item.status.as_deref() {
+        Some("completed") => api::message::web_search::status::Type::Success(
+            api::message::web_search::status::Success {
+                query,
+                pages: pages
+                    .into_iter()
+                    .map(|(url, title)| api::message::web_search::status::success::SearchedPage {
+                        url,
+                        title,
+                    })
+                    .collect(),
+            },
+        ),
+        Some("in_progress") | Some("searching") => {
+            api::message::web_search::status::Type::Searching(
+                api::message::web_search::status::Searching { query },
+            )
+        }
+        Some("failed") => api::message::web_search::status::Type::Error(()),
+        Some(_) | None => api::message::web_search::status::Type::Success(
+            api::message::web_search::status::Success {
+                query,
+                pages: pages
+                    .into_iter()
+                    .map(|(url, title)| api::message::web_search::status::success::SearchedPage {
+                        url,
+                        title,
+                    })
+                    .collect(),
+            },
+        ),
+    };
+
+    Some(api::Message {
+        id: Uuid::new_v4().to_string(),
+        task_id: task_id.to_string(),
+        server_message_data: String::new(),
+        citations: vec![],
+        message: Some(api::message::Message::WebSearch(api::message::WebSearch {
+            status: Some(api::message::web_search::Status {
+                r#type: Some(status),
+            }),
+        })),
+        request_id: request_id.to_string(),
+        timestamp: None,
+    })
+}
+
+/// Extracts a search query from the minimal web-search action payload.
+fn web_search_query_from_action(action: Option<&ResponsesWebSearchAction>) -> Option<String> {
+    action
+        .filter(|action| action.action_type == "search")
+        .and_then(|action| action.query.as_ref())
+        .map(|query| query.trim().to_string())
+        .filter(|query| !query.is_empty())
+}
+
+/// Collects the searched pages associated with a completed web-search call.
+fn web_search_pages_from_item(
+    item: &ResponsesOutputItem,
+    citation_titles_by_url: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut seen_urls = HashSet::new();
+    let mut pages = Vec::new();
+
+    if let Some(action) = item.action.as_ref() {
+        for source in &action.sources {
+            if source.source_type != "url" {
+                continue;
+            }
+            let Some(url) = source.url.clone().filter(|url| !url.is_empty()) else {
+                continue;
+            };
+            if !seen_urls.insert(url.clone()) {
+                continue;
+            }
+            pages.push((
+                url.clone(),
+                citation_titles_by_url.get(&url).cloned().unwrap_or_default(),
+            ));
+        }
+    }
+
+    pages
+}
+
+/// Extracts a URL citation from an `output_text` annotation in either flat or nested form.
+fn output_text_annotation_as_web_page(
+    annotation: &ResponsesOutputTextAnnotation,
+) -> Option<(String, String)> {
+    let annotation_type = if annotation.item_type.is_empty() {
+        annotation
+            .url_citation
+            .as_ref()
+            .map(|nested| nested.item_type.as_str())
+            .unwrap_or_default()
+    } else {
+        annotation.item_type.as_str()
+    };
+    if annotation_type != "url_citation" {
+        return None;
+    }
+
+    let url = annotation
+        .url
+        .clone()
+        .or_else(|| annotation.url_citation.as_ref().and_then(|nested| nested.url.clone()))?;
+    let title = annotation
+        .title
+        .clone()
+        .or_else(|| {
+            annotation
+                .url_citation
+                .as_ref()
+                .and_then(|nested| nested.title.clone())
+        })
+        .unwrap_or_default();
+
+    Some((url, title))
 }
 
 /// Builds reasoning messages from a completed reasoning output item that was not streamed incrementally.
@@ -1062,8 +1296,19 @@ fn tool_call_message(
 }
 
 /// Converts assistant text into a Warp agent output message.
-fn agent_output_message(task_id: &TaskId, request_id: &str, text: String) -> api::Message {
-    agent_output_message_with_id(Uuid::new_v4().to_string(), task_id, request_id, text)
+fn agent_output_message(
+    task_id: &TaskId,
+    request_id: &str,
+    text: String,
+    citations: Vec<api::Citation>,
+) -> api::Message {
+    agent_output_message_with_id(
+        Uuid::new_v4().to_string(),
+        task_id,
+        request_id,
+        text,
+        citations,
+    )
 }
 
 /// Converts reasoning text into a Warp agent reasoning message with a stable message ID.
@@ -1096,12 +1341,13 @@ pub(super) fn agent_output_message_with_id(
     task_id: &TaskId,
     request_id: &str,
     text: String,
+    citations: Vec<api::Citation>,
 ) -> api::Message {
     api::Message {
         id: message_id,
         task_id: task_id.to_string(),
         server_message_data: String::new(),
-        citations: vec![],
+        citations,
         message: Some(api::message::Message::AgentOutput(
             api::message::AgentOutput { text },
         )),
@@ -1129,9 +1375,43 @@ pub(super) fn update_agent_output_text_event(
                                 task_id,
                                 request_id,
                                 full_text,
+                                vec![],
                             )),
                             mask: Some(prost_types::FieldMask {
                                 paths: vec!["agent_output.text".to_string()],
+                            }),
+                        },
+                    )),
+                }],
+            },
+        )),
+    }
+}
+
+/// Builds an update client action that attaches citations to an existing assistant message.
+fn update_agent_output_citations_event(
+    task_id: &TaskId,
+    request_id: &str,
+    message_id: &str,
+    full_text: String,
+    citations: Vec<api::Citation>,
+) -> api::ResponseEvent {
+    api::ResponseEvent {
+        r#type: Some(api::response_event::Type::ClientActions(
+            api::response_event::ClientActions {
+                actions: vec![api::ClientAction {
+                    action: Some(api::client_action::Action::UpdateTaskMessage(
+                        api::client_action::UpdateTaskMessage {
+                            task_id: task_id.to_string(),
+                            message: Some(agent_output_message_with_id(
+                                message_id.to_string(),
+                                task_id,
+                                request_id,
+                                full_text,
+                                citations,
+                            )),
+                            mask: Some(prost_types::FieldMask {
+                                paths: vec!["citations".to_string()],
                             }),
                         },
                     )),

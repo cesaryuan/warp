@@ -17,7 +17,8 @@ use super::stream::{
 use super::tool_calls::parse_read_file;
 use super::types::{
     ResponsesApiResponse, ResponsesContentItem, ResponsesFunctionCallArgumentsDoneEvent,
-    ResponsesOutputItem, ResponsesReasoningSummaryPart, StreamingResponsesAccumulator,
+    ResponsesOutputItem, ResponsesOutputTextAnnotation, ResponsesReasoningSummaryPart,
+    ResponsesWebSearchAction, ResponsesWebSearchSource, StreamingResponsesAccumulator,
     StreamingTextMessageState,
 };
 use super::*;
@@ -61,6 +62,7 @@ fn request_params_for_local_backend_tests() -> RequestParams {
         local_openai_api_key: None,
         local_openai_base_url: None,
         model_provider: LLMProvider::OpenAI,
+        context_window_limit: None,
         autonomy_level: api::AutonomyLevel::Supervised,
         isolation_level: api::IsolationLevel::None,
         web_search_enabled: false,
@@ -512,6 +514,34 @@ fn prepare_local_responses_request_sets_session_id_header_from_prompt_cache_key(
     );
 }
 
+/// Verifies that web search is exposed to the local Responses backend when enabled.
+#[test]
+fn prepare_local_responses_request_includes_web_search_tool_when_enabled() {
+    let mut params = request_params_for_local_backend_tests();
+    params.local_openai_api_key = Some("test-key".to_string());
+    params.local_openai_base_url = Some("https://example.com".to_string());
+    params.web_search_enabled = true;
+
+    let prepared_request =
+        prepare_local_responses_request(&params).expect("request should prepare successfully");
+    let request_body = serde_json::to_value(&prepared_request.request_body)
+        .expect("request body should serialize");
+    let tools = request_body["tools"]
+        .as_array()
+        .expect("tools should serialize as an array");
+
+    assert!(tools
+        .iter()
+        .any(|tool| tool["type"] == serde_json::json!("web_search")));
+    assert_eq!(
+        request_body["include"],
+        serde_json::json!([
+            "reasoning.encrypted_content",
+            "web_search_call.action.sources"
+        ])
+    );
+}
+
 /// Verifies that streaming text deltas update the existing agent output field.
 #[test]
 fn update_agent_output_text_event_replaces_text() {
@@ -521,6 +551,7 @@ fn update_agent_output_text_event_replaces_text() {
         &task_id,
         "request-id",
         "hello".to_string(),
+        vec![],
     );
     let update_event = update_agent_output_text_event(
         &task_id,
@@ -660,6 +691,8 @@ fn finalize_stream_state_backfills_reasoning_messages_from_completed_output() {
                     name: None,
                     call_id: None,
                     arguments: None,
+                    status: None,
+                    action: None,
                 },
                 ResponsesOutputItem {
                     id: Some("msg_1".to_string()),
@@ -668,12 +701,15 @@ fn finalize_stream_state_backfills_reasoning_messages_from_completed_output() {
                     content: vec![ResponsesContentItem {
                         item_type: "output_text".to_string(),
                         text: Some("Done".to_string()),
+                        annotations: vec![],
                     }],
                     summary: vec![],
                     encrypted_content: None,
                     name: None,
                     call_id: None,
                     arguments: None,
+                    status: None,
+                    action: None,
                 },
             ],
         }),
@@ -736,6 +772,205 @@ fn finalize_stream_state_backfills_reasoning_messages_from_completed_output() {
         .remove(&params.conversation_id);
 }
 
+/// Verifies that completed web-search outputs become Warp web-search messages and webpage citations.
+#[test]
+fn finalize_stream_state_backfills_web_search_and_webpage_citations() {
+    let params = request_params_for_local_backend_tests();
+    conversation_state_store()
+        .lock()
+        .insert(params.conversation_id, LocalConversationState::default());
+
+    let events = finalize_stream_state(
+        &params,
+        StreamingResponsesAccumulator::default(),
+        "request-id",
+        Some(ResponsesApiResponse {
+            output: vec![
+                ResponsesOutputItem {
+                    id: Some("ws_1".to_string()),
+                    item_type: "web_search_call".to_string(),
+                    role: None,
+                    content: vec![],
+                    summary: vec![],
+                    encrypted_content: None,
+                    name: None,
+                    call_id: None,
+                    arguments: None,
+                    status: Some("completed".to_string()),
+                    action: Some(ResponsesWebSearchAction {
+                        action_type: "search".to_string(),
+                        query: Some("rust async".to_string()),
+                        sources: vec![ResponsesWebSearchSource {
+                            source_type: "url".to_string(),
+                            url: Some("https://example.com/rust-async".to_string()),
+                        }],
+                    }),
+                },
+                ResponsesOutputItem {
+                    id: Some("msg_1".to_string()),
+                    item_type: "message".to_string(),
+                    role: Some("assistant".to_string()),
+                    content: vec![ResponsesContentItem {
+                        item_type: "output_text".to_string(),
+                        text: Some("Rust async overview".to_string()),
+                        annotations: vec![ResponsesOutputTextAnnotation {
+                            item_type: "url_citation".to_string(),
+                            url: Some("https://example.com/rust-async".to_string()),
+                            title: Some("Rust Async Guide".to_string()),
+                            url_citation: None,
+                        }],
+                    }],
+                    summary: vec![],
+                    encrypted_content: None,
+                    name: None,
+                    call_id: None,
+                    arguments: None,
+                    status: None,
+                    action: None,
+                },
+            ],
+        }),
+    )
+    .expect("completed payload should finalize");
+
+    assert_eq!(events.len(), 2);
+    let add_messages_event = events[0].as_ref().expect("add-messages event should be ok");
+    let Some(api::response_event::Type::ClientActions(actions)) = &add_messages_event.r#type else {
+        panic!("expected client actions");
+    };
+    let Some(api::client_action::Action::AddMessagesToTask(add_messages)) =
+        actions.actions[0].action.as_ref()
+    else {
+        panic!("expected add-messages action");
+    };
+
+    let web_search = add_messages
+        .messages
+        .iter()
+        .find_map(|message| match &message.message {
+            Some(api::message::Message::WebSearch(web_search)) => Some(web_search),
+            _ => None,
+        })
+        .expect("expected a web-search message");
+    let Some(api::message::web_search::status::Type::Success(success)) =
+        web_search.status.as_ref().and_then(|status| status.r#type.as_ref())
+    else {
+        panic!("expected a completed web-search status");
+    };
+    assert_eq!(success.query, "rust async");
+    assert_eq!(success.pages.len(), 1);
+    assert_eq!(success.pages[0].url, "https://example.com/rust-async");
+    assert_eq!(success.pages[0].title, "Rust Async Guide");
+
+    let agent_output = add_messages
+        .messages
+        .iter()
+        .find_map(|message| match &message.message {
+            Some(api::message::Message::AgentOutput(_agent_output)) => Some(message),
+            _ => None,
+        })
+        .expect("expected an agent output message");
+    assert_eq!(agent_output.citations.len(), 1);
+    assert_eq!(
+        agent_output.citations[0].document_id,
+        "https://example.com/rust-async"
+    );
+    assert_eq!(
+        agent_output.citations[0].document_type,
+        api::DocumentType::WebPage as i32
+    );
+
+    conversation_state_store()
+        .lock()
+        .remove(&params.conversation_id);
+}
+
+/// Verifies that completed assistant messages can attach citations onto text streamed earlier.
+#[test]
+fn finalize_stream_state_updates_streamed_text_with_webpage_citations() {
+    let params = request_params_for_local_backend_tests();
+    let task_id = TaskId::new("task-id".to_string());
+    let mut accumulator = StreamingResponsesAccumulator::default();
+    accumulator.emitted_text_item_ids.push("msg_1".to_string());
+    accumulator.text_messages_by_item_id.insert(
+        "msg_1".to_string(),
+        StreamingTextMessageState {
+            message_id: "message-1".to_string(),
+            text: "Rust async overview".to_string(),
+        },
+    );
+
+    let events = finalize_stream_state(
+        &params,
+        accumulator,
+        "request-id",
+        Some(ResponsesApiResponse {
+            output: vec![ResponsesOutputItem {
+                id: Some("msg_1".to_string()),
+                item_type: "message".to_string(),
+                role: Some("assistant".to_string()),
+                content: vec![ResponsesContentItem {
+                    item_type: "output_text".to_string(),
+                    text: Some("Rust async overview".to_string()),
+                    annotations: vec![ResponsesOutputTextAnnotation {
+                        item_type: "url_citation".to_string(),
+                        url: Some("https://example.com/rust-async".to_string()),
+                        title: Some("Rust Async Guide".to_string()),
+                        url_citation: None,
+                    }],
+                }],
+                summary: vec![],
+                encrypted_content: None,
+                name: None,
+                call_id: None,
+                arguments: None,
+                status: None,
+                action: None,
+            }],
+        }),
+    )
+    .expect("completed payload should finalize");
+
+    assert_eq!(events.len(), 2);
+    let update_event = events[0].as_ref().expect("update event should be ok");
+    let Some(api::response_event::Type::ClientActions(actions)) = &update_event.r#type else {
+        panic!("expected client actions");
+    };
+    let Some(api::client_action::Action::UpdateTaskMessage(update)) =
+        actions.actions[0].action.as_ref()
+    else {
+        panic!("expected update action");
+    };
+    let initial_message = agent_output_message_with_id(
+        "message-1".to_string(),
+        &task_id,
+        "request-id",
+        "Rust async overview".to_string(),
+        vec![],
+    );
+    let merged = field_mask::FieldMaskOperation::update(
+        &api::MESSAGE_DESCRIPTOR,
+        &initial_message,
+        update
+            .message
+            .as_ref()
+            .expect("update message should exist"),
+        update.mask.clone().expect("update mask should exist"),
+    )
+    .apply()
+    .expect("citation update should succeed");
+
+    assert_eq!(merged.citations.len(), 1);
+    assert_eq!(
+        merged.citations[0].document_id,
+        "https://example.com/rust-async"
+    );
+    assert_eq!(
+        merged.citations[0].document_type,
+        api::DocumentType::WebPage as i32
+    );
+}
+
 /// Verifies that reasoning encrypted content captured from `output_item.done` survives even if `response.completed` omits the reasoning item.
 #[test]
 fn finalize_stream_state_preserves_reasoning_history_from_output_item_done() {
@@ -769,12 +1004,15 @@ fn finalize_stream_state_preserves_reasoning_history_from_output_item_done() {
                 content: vec![ResponsesContentItem {
                     item_type: "output_text".to_string(),
                     text: Some("Done".to_string()),
+                    annotations: vec![],
                 }],
                 summary: vec![],
                 encrypted_content: None,
                 name: None,
                 call_id: None,
                 arguments: None,
+                status: None,
+                action: None,
             }],
         }),
     )
@@ -836,6 +1074,8 @@ fn finalize_stream_state_preserves_empty_reasoning_summary_array() {
                 name: None,
                 call_id: None,
                 arguments: None,
+                status: None,
+                action: None,
             }],
         }),
     )
@@ -933,6 +1173,8 @@ fn streamed_function_calls_use_output_item_done_to_get_real_call_id() {
             name: Some("file_glob".to_string()),
             call_id: Some("call_real_123".to_string()),
             arguments: Some(r#"{"path":"."}"#.to_string()),
+            status: None,
+            action: None,
         },
     )
     .expect("output_item.done should not error")
@@ -978,6 +1220,8 @@ fn streamed_function_calls_wait_for_output_item_name() {
             name: Some("file_glob".to_string()),
             call_id: Some("call_real_456".to_string()),
             arguments: Some(r#"{"path":"."}"#.to_string()),
+            status: None,
+            action: None,
         },
     )
     .expect("output_item.done should not error")
@@ -1011,6 +1255,8 @@ fn streamed_function_calls_fall_back_to_item_id_when_output_item_has_no_call_id(
             name: Some("file_glob".to_string()),
             call_id: None,
             arguments: Some(r#"{"path":"."}"#.to_string()),
+            status: None,
+            action: None,
         },
     )
     .expect("output_item.done should not error")
