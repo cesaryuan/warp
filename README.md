@@ -22,7 +22,7 @@
 > OpenAI is the founding sponsor of the new, open-source Warp repository, and the new agentic management workflows are powered by GPT models.
 
 > [!IMPORTANT]
-> This repository is a modified Warp fork rather than the official upstream Warp repository. It is based on Warp, but includes custom behavior focused on making BYOK and OpenAI-compatible backends more flexible for all users.
+> This repository is a modified Warp fork rather than the official upstream Warp repository. It is based on Warp, but includes custom behavior focused on making BYOK and OpenAI-compatible backends more flexible for all users. You can discuss this fork on the [Linux Do](https://linux.do/)
 
 <h1></h1>
 
