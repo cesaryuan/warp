@@ -418,9 +418,10 @@ fn prepare_local_responses_request_configures_parallel_tool_calls_and_store_poli
         request_body["include"],
         serde_json::json!(["reasoning.encrypted_content"])
     );
-    assert!(request_body["prompt_cache_key"]
-        .as_str()
-        .is_some_and(|value| value.starts_with("warp-local-openai:")));
+    assert_eq!(
+        request_body["prompt_cache_key"],
+        serde_json::json!(params.conversation_id.to_string())
+    );
 }
 
 /// Verifies that prompt cache keys stay stable across per-turn input changes within the same conversation.
@@ -693,6 +694,19 @@ fn finalize_stream_state_backfills_reasoning_messages_from_completed_output() {
         reasoning_item["encrypted_content"],
         serde_json::json!("enc_reasoning_payload")
     );
+    assert_eq!(
+        reasoning_item["summary"],
+        serde_json::json!([
+            {
+                "type": "summary_text",
+                "text": "Checked the repository wiring first."
+            }
+        ])
+    );
+    assert!(
+        reasoning_item.get("id").is_none(),
+        "replayed reasoning items should not send ids back"
+    );
 
     conversation_state_store()
         .lock()
@@ -757,6 +771,64 @@ fn finalize_stream_state_preserves_reasoning_history_from_output_item_done() {
         reasoning_item["encrypted_content"],
         serde_json::json!("enc_from_output_item_done")
     );
+    assert_eq!(
+        reasoning_item["summary"],
+        serde_json::json!([
+            {
+                "type": "summary_text",
+                "text": "Need to keep this reasoning context."
+            }
+        ])
+    );
+    assert!(
+        reasoning_item.get("id").is_none(),
+        "replayed reasoning items should not send ids back"
+    );
+
+    conversation_state_store()
+        .lock()
+        .remove(&params.conversation_id);
+}
+
+/// Verifies that replayed reasoning items preserve an explicit empty summary array.
+#[test]
+fn finalize_stream_state_preserves_empty_reasoning_summary_array() {
+    let params = request_params_for_local_backend_tests();
+    conversation_state_store()
+        .lock()
+        .insert(params.conversation_id, LocalConversationState::default());
+
+    finalize_stream_state(
+        &params,
+        StreamingResponsesAccumulator::default(),
+        "request-id",
+        Some(ResponsesApiResponse {
+            output: vec![ResponsesOutputItem {
+                id: Some("rs_empty_summary".to_string()),
+                item_type: "reasoning".to_string(),
+                role: None,
+                content: vec![],
+                summary: vec![],
+                encrypted_content: Some("enc_empty_summary".to_string()),
+                name: None,
+                call_id: None,
+                arguments: None,
+            }],
+        }),
+    )
+    .expect("completed payload should finalize");
+
+    let stored_items = conversation_state_store()
+        .lock()
+        .get(&params.conversation_id)
+        .cloned()
+        .expect("conversation state should exist")
+        .items;
+    let reasoning_item = stored_items
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .expect("expected stored reasoning history item");
+    assert_eq!(reasoning_item["summary"], serde_json::json!([]));
 
     conversation_state_store()
         .lock()

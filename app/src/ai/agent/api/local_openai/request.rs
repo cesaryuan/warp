@@ -97,7 +97,7 @@ fn responses_include_fields() -> Vec<String> {
 
 /// Builds a stable prompt cache key from Warp's conversation identity so repeated turns reuse the same cache route.
 fn build_prompt_cache_key(params: &RequestParams) -> Option<String> {
-    Some(format!("warp-local-openai:{}", params.conversation_id))
+    Some(params.conversation_id.to_string())
 }
 
 /// Opens a local Responses event stream from a prepared request payload.
@@ -445,27 +445,20 @@ pub(super) fn reasoning_history_item(item: &ResponsesOutputItem) -> Option<Value
         "encrypted_content".to_string(),
         Value::String(encrypted_content.to_string()),
     );
-
-    if let Some(id) = item.id.as_ref().filter(|id| !id.is_empty()) {
-        history_item.insert("id".to_string(), Value::String(id.clone()));
-    }
-
-    if !item.summary.is_empty() {
-        history_item.insert(
-            "summary".to_string(),
-            Value::Array(
-                item.summary
-                    .iter()
-                    .map(|part| {
-                        json!({
-                            "type": part.item_type,
-                            "text": part.text,
-                        })
+    history_item.insert(
+        "summary".to_string(),
+        Value::Array(
+            item.summary
+                .iter()
+                .map(|part| {
+                    json!({
+                        "type": part.item_type,
+                        "text": part.text,
                     })
-                    .collect(),
-            ),
-        );
-    }
+                })
+                .collect(),
+        ),
+    );
 
     if !item.content.is_empty() {
         history_item.insert(
