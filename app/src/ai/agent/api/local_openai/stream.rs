@@ -125,6 +125,7 @@ pub(super) fn handle_responses_stream_message(
         "response.output_item.done" => {
             let done_event: ResponsesOutputItemDoneEvent = serde_json::from_value(payload)?;
             if done_event.item.item_type == "reasoning" {
+                record_reasoning_history_item(accumulator, &done_event.item);
                 let reasoning_messages = reasoning_messages_from_output_item(
                     task_id,
                     request_id,
@@ -555,7 +556,7 @@ pub(super) fn finalize_stream_state(
         let history_items = if output.is_empty() {
             history_items_from_accumulator(&accumulator)?
         } else {
-            match history_items_from_completed_output(output.clone()) {
+            match history_items_from_completed_output(output.clone(), &accumulator) {
                 Ok(history_items) => {
                     if history_items.is_empty() && has_streamed_output(&accumulator) {
                         history_items_from_accumulator(&accumulator)?
@@ -612,6 +613,13 @@ fn history_items_from_accumulator(
 ) -> anyhow::Result<Vec<Value>> {
     let mut items = Vec::new();
 
+    for key in &accumulator.reasoning_history_item_keys_in_order {
+        let Some(reasoning_item) = accumulator.reasoning_history_items_by_key.get(key) else {
+            continue;
+        };
+        items.push(reasoning_item.clone());
+    }
+
     for item_id in &accumulator.emitted_text_item_ids {
         let Some(message_state) = accumulator.text_messages_by_item_id.get(item_id) else {
             continue;
@@ -647,8 +655,10 @@ fn history_items_from_accumulator(
 /// Converts completed Responses output items into replayable history while preserving reasoning context.
 fn history_items_from_completed_output(
     output: Vec<ResponsesOutputItem>,
+    accumulator: &StreamingResponsesAccumulator,
 ) -> anyhow::Result<Vec<Value>> {
     let mut history_items = Vec::new();
+    let mut recorded_reasoning_keys = std::collections::HashSet::new();
 
     for item in output {
         match item.item_type.as_str() {
@@ -666,6 +676,9 @@ fn history_items_from_completed_output(
             }
             "reasoning" => {
                 if let Some(reasoning_item) = reasoning_history_item(&item) {
+                    if let Some(key) = reasoning_history_item_key(&item) {
+                        recorded_reasoning_keys.insert(key);
+                    }
                     history_items.push(reasoning_item);
                 }
             }
@@ -690,6 +703,16 @@ fn history_items_from_completed_output(
             }
             _ => {}
         }
+    }
+
+    for key in &accumulator.reasoning_history_item_keys_in_order {
+        if recorded_reasoning_keys.contains(key) {
+            continue;
+        }
+        let Some(reasoning_item) = accumulator.reasoning_history_items_by_key.get(key) else {
+            continue;
+        };
+        history_items.push(reasoning_item.clone());
     }
 
     Ok(history_items)
@@ -807,6 +830,31 @@ fn reasoning_messages_from_output_item(
         .collect()
 }
 
+/// Records a replayable reasoning history item from streaming metadata so stateless follow-ups keep encrypted context.
+fn record_reasoning_history_item(
+    accumulator: &mut StreamingResponsesAccumulator,
+    item: &ResponsesOutputItem,
+) {
+    let Some(reasoning_item) = reasoning_history_item(item) else {
+        return;
+    };
+    let Some(key) = reasoning_history_item_key(item) else {
+        return;
+    };
+
+    if !accumulator
+        .reasoning_history_items_by_key
+        .contains_key(&key)
+    {
+        accumulator
+            .reasoning_history_item_keys_in_order
+            .push(key.clone());
+    }
+    accumulator
+        .reasoning_history_items_by_key
+        .insert(key, reasoning_item);
+}
+
 /// Extracts the reasoning texts Warp should render from a Responses reasoning output item.
 fn reasoning_output_texts(item: &ResponsesOutputItem) -> Vec<ReasoningOutputText> {
     let summary_texts = item
@@ -852,6 +900,20 @@ fn normalize_reasoning_output_text(part_type: &str, text: Option<&str>) -> Optio
 /// Returns the stable key used to dedupe backfilled reasoning messages against streamed ones.
 fn backfill_reasoning_key(item_id: Option<&str>, key_kind: &str, index: usize) -> Option<String> {
     item_id.map(|item_id| format!("reasoning:{key_kind}:{item_id}:{index}"))
+}
+
+/// Returns the stable key used to store replayable reasoning history items in the stream accumulator.
+fn reasoning_history_item_key(item: &ResponsesOutputItem) -> Option<String> {
+    item.id
+        .as_ref()
+        .filter(|item_id| !item_id.is_empty())
+        .map(|item_id| format!("reasoning_history:{item_id}"))
+        .or_else(|| {
+            item.encrypted_content
+                .as_ref()
+                .filter(|encrypted_content| !encrypted_content.is_empty())
+                .map(|encrypted_content| format!("reasoning_history:{encrypted_content}"))
+        })
 }
 
 /// Returns whether a reasoning part type matches the corresponding streamed event family.

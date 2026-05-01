@@ -142,6 +142,8 @@ pub(super) struct StreamingResponsesAccumulator {
     pub(super) emitted_text_item_ids: Vec<String>,
     pub(super) reasoning_messages_by_key: HashMap<String, StreamingReasoningMessageState>,
     pub(super) emitted_reasoning_keys: Vec<String>,
+    pub(super) reasoning_history_items_by_key: HashMap<String, Value>,
+    pub(super) reasoning_history_item_keys_in_order: Vec<String>,
     pub(super) function_calls_by_call_id: HashMap<String, StreamingFunctionCallState>,
     pub(super) emitted_function_call_ids: Vec<String>,
 }
@@ -154,6 +156,8 @@ impl Default for StreamingResponsesAccumulator {
             emitted_text_item_ids: Vec::new(),
             reasoning_messages_by_key: HashMap::new(),
             emitted_reasoning_keys: Vec::new(),
+            reasoning_history_items_by_key: HashMap::new(),
+            reasoning_history_item_keys_in_order: Vec::new(),
             function_calls_by_call_id: HashMap::new(),
             emitted_function_call_ids: Vec::new(),
         }

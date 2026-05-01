@@ -631,6 +631,70 @@ fn finalize_stream_state_backfills_reasoning_messages_from_completed_output() {
         .remove(&params.conversation_id);
 }
 
+/// Verifies that reasoning encrypted content captured from `output_item.done` survives even if `response.completed` omits the reasoning item.
+#[test]
+fn finalize_stream_state_preserves_reasoning_history_from_output_item_done() {
+    let params = request_params_for_local_backend_tests();
+    let task_id = TaskId::new("task-id".to_string());
+    conversation_state_store()
+        .lock()
+        .insert(params.conversation_id, LocalConversationState::default());
+    let mut accumulator = StreamingResponsesAccumulator::default();
+
+    let result = handle_responses_stream_message(
+        &params,
+        &task_id,
+        "request-id",
+        "response.output_item.done",
+        r#"{"item":{"id":"rs_stream_1","type":"reasoning","content":[],"summary":[{"type":"summary_text","text":"Need to keep this reasoning context."}],"encrypted_content":"enc_from_output_item_done"}}"#,
+        &mut accumulator,
+    )
+    .expect("reasoning output_item.done should parse");
+    assert_eq!(result.events.len(), 1);
+
+    finalize_stream_state(
+        &params,
+        accumulator,
+        "request-id",
+        Some(ResponsesApiResponse {
+            output: vec![ResponsesOutputItem {
+                id: Some("msg_1".to_string()),
+                item_type: "message".to_string(),
+                role: Some("assistant".to_string()),
+                content: vec![ResponsesContentItem {
+                    item_type: "output_text".to_string(),
+                    text: Some("Done".to_string()),
+                }],
+                summary: vec![],
+                encrypted_content: None,
+                name: None,
+                call_id: None,
+                arguments: None,
+            }],
+        }),
+    )
+    .expect("completed payload should finalize");
+
+    let stored_items = conversation_state_store()
+        .lock()
+        .get(&params.conversation_id)
+        .cloned()
+        .expect("conversation state should exist")
+        .items;
+    let reasoning_item = stored_items
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .expect("expected stored reasoning history item");
+    assert_eq!(
+        reasoning_item["encrypted_content"],
+        serde_json::json!("enc_from_output_item_done")
+    );
+
+    conversation_state_store()
+        .lock()
+        .remove(&params.conversation_id);
+}
+
 /// Verifies that an empty completed payload does not fail if text was already streamed.
 #[test]
 fn finalize_stream_state_accepts_empty_completed_payload_after_streamed_text() {
