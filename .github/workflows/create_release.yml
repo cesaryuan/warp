@@ -39,6 +39,10 @@ on:
         description: Build macOS artifacts.
         type: boolean
         default: true
+      build_macos_x86:
+        description: Build macOS x86_64 artifacts in addition to arm64.
+        type: boolean
+        default: false
       build_web:
         description: Build web artifacts.
         type: boolean
@@ -132,6 +136,10 @@ on:
         description: Build macOS artifacts.
         type: boolean
         default: true
+      build_macos_x86:
+        description: Build macOS x86_64 artifacts in addition to arm64.
+        type: boolean
+        default: false
       build_web:
         description: Build web artifacts.
         type: boolean
@@ -305,15 +313,11 @@ jobs:
     runs-on: ${{ inputs.runner_macos }}
     needs: prepare_release
     if: ${{ inputs.build_macos != false }}
-    timeout-minutes: 100
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: aarch64
-            dmg_name_suffix: arm64
-          - arch: x86_64
-            dmg_name_suffix: x86_64
+        include: ${{ fromJSON(inputs.build_macos_x86 && '[{"arch":"aarch64","dmg_name_suffix":"arm64"},{"arch":"x86_64","dmg_name_suffix":"x86_64"}]' || '[{"arch":"aarch64","dmg_name_suffix":"arm64"}]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -442,8 +446,8 @@ jobs:
     name: Build Release (macOS Universal)
     runs-on: ${{ inputs.runner_macos }}
     needs: [prepare_release, release_macos_single_arch]
-    if: ${{ inputs.build_macos != false }}
-    timeout-minutes: 100
+    if: ${{ inputs.build_macos != false && inputs.build_macos_x86 != false }}
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -600,9 +604,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: aarch64
-          - arch: x86_64
+        include: ${{ fromJSON(inputs.build_macos_x86 && '[{"arch":"aarch64"},{"arch":"x86_64"}]' || '[{"arch":"aarch64"}]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -1818,7 +1820,7 @@ jobs:
           if [[ ${{ needs.release_macos_single_arch.result }} != 'success' ]]; then
               FAILED+=("MacOS Single Arch")
           fi
-          if [[ ${{ needs.release_macos_universal.result }} != 'success' ]]; then
+          if [[ "${{ inputs.build_macos_x86 }}" == "true" && ${{ needs.release_macos_universal.result }} != 'success' ]]; then
               FAILED+=("MacOS Universal")
           fi
           if [[ "${{ inputs.build_cli }}" == "true" && ${{ needs.release_macos_cli.result }} != 'success' ]]; then

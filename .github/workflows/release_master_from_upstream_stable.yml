@@ -42,6 +42,11 @@ on:
         required: true
         type: boolean
         default: false
+      build_macos_x86:
+        description: Build macOS x86_64 artifacts in addition to arm64.
+        required: true
+        type: boolean
+        default: false
       build_web:
         description: Build web artifacts.
         required: true
@@ -143,6 +148,7 @@ jobs:
       build_windows: ${{ github.event_name == 'workflow_dispatch' && inputs.build_windows || true }}
       build_windows_arm: ${{ github.event_name == 'workflow_dispatch' && inputs.build_windows_arm || false }}
       build_macos: ${{ github.event_name == 'workflow_dispatch' && inputs.build_macos || false }}
+      build_macos_x86: ${{ github.event_name == 'workflow_dispatch' && inputs.build_macos_x86 || false }}
       build_web: ${{ github.event_name == 'workflow_dispatch' && inputs.build_web || false }}
       build_cli: ${{ github.event_name == 'workflow_dispatch' && inputs.build_cli || false }}
       should_publish: true
