@@ -11,8 +11,10 @@ use warp_multi_agent_api as api;
 
 use crate::ai::agent::api::{convert_to::convert_input, user_inputs_from_messages};
 use crate::ai::agent::{
-    AIAgentActionResult, AIAgentActionResultType, AIAgentContext, AIAgentInput,
-    AskUserQuestionAnswerItem, AskUserQuestionResult, MCPContext, MCPServer,
+    AIAgentActionResult, AIAgentActionResultType, AIAgentContext, AIAgentInput, AnyFileContent,
+    AskUserQuestionAnswerItem, AskUserQuestionResult, FileContext, MCPContext, MCPServer,
+    ReadFilesResult, ReadShellCommandOutputResult, ReadSkillResult, RequestCommandOutputResult,
+    SearchCodebaseResult, WriteToLongRunningShellCommandResult,
 };
 use crate::server::server_api::ServerApi;
 
@@ -560,11 +562,237 @@ fn function_call_output_item(call_id: String, output: String) -> Value {
 
 fn serialize_tool_result_output(result: &AIAgentActionResult) -> String {
     match &result.result {
+        AIAgentActionResultType::RequestCommandOutput(command_result) => {
+            serialize_request_command_output_result(command_result).to_string()
+        }
+        AIAgentActionResultType::WriteToLongRunningShellCommand(command_result) => {
+            serialize_write_to_long_running_shell_command_result(command_result).to_string()
+        }
+        AIAgentActionResultType::ReadShellCommandOutput(command_result) => {
+            serialize_read_shell_command_output_result(command_result).to_string()
+        }
+        AIAgentActionResultType::ReadFiles(read_files_result) => {
+            serialize_read_files_result(read_files_result).to_string()
+        }
+        AIAgentActionResultType::SearchCodebase(search_result) => {
+            serialize_search_codebase_result(search_result).to_string()
+        }
+        AIAgentActionResultType::ReadSkill(read_skill_result) => {
+            serialize_read_skill_result(read_skill_result).to_string()
+        }
         AIAgentActionResultType::AskUserQuestion(ask_result) => {
             serialize_ask_user_question_result(ask_result).to_string()
         }
         _ => result.to_string(),
     }
+}
+
+fn serialize_request_command_output_result(result: &RequestCommandOutputResult) -> Value {
+    match result {
+        RequestCommandOutputResult::Completed {
+            block_id,
+            command,
+            output,
+            exit_code,
+        } => json!({
+            "status": "completed",
+            "command": command,
+            "command_id": block_id.to_string(),
+            "output": output,
+            "exit_code": exit_code.value(),
+        }),
+        RequestCommandOutputResult::LongRunningCommandSnapshot {
+            block_id,
+            command,
+            grid_contents,
+            cursor,
+            is_alt_screen_active,
+        } => json!({
+            "status": "long_running",
+            "command": command,
+            "command_id": block_id.to_string(),
+            "output": grid_contents,
+            "cursor": cursor,
+            "is_alt_screen_active": is_alt_screen_active,
+            "is_preempted": false,
+        }),
+        RequestCommandOutputResult::CancelledBeforeExecution => json!({
+            "status": "cancelled",
+        }),
+        RequestCommandOutputResult::Denylisted { command } => json!({
+            "status": "permission_denied",
+            "command": command,
+            "reason": "denylisted_command",
+        }),
+    }
+}
+
+fn serialize_write_to_long_running_shell_command_result(
+    result: &WriteToLongRunningShellCommandResult,
+) -> Value {
+    match result {
+        WriteToLongRunningShellCommandResult::Snapshot {
+            block_id,
+            grid_contents,
+            cursor,
+            is_alt_screen_active,
+            is_preempted,
+        } => json!({
+            "status": "long_running",
+            "command_id": block_id.to_string(),
+            "output": grid_contents,
+            "cursor": cursor,
+            "is_alt_screen_active": is_alt_screen_active,
+            "is_preempted": is_preempted,
+        }),
+        WriteToLongRunningShellCommandResult::CommandFinished {
+            block_id,
+            output,
+            exit_code,
+        } => json!({
+            "status": "completed",
+            "command_id": block_id.to_string(),
+            "output": output,
+            "exit_code": exit_code.value(),
+        }),
+        WriteToLongRunningShellCommandResult::Cancelled => json!({
+            "status": "cancelled",
+        }),
+        WriteToLongRunningShellCommandResult::Error(_) => json!({
+            "status": "error",
+            "error_type": "command_not_found",
+        }),
+    }
+}
+
+fn serialize_read_shell_command_output_result(result: &ReadShellCommandOutputResult) -> Value {
+    match result {
+        ReadShellCommandOutputResult::CommandFinished {
+            command,
+            block_id,
+            output,
+            exit_code,
+        } => json!({
+            "status": "completed",
+            "command": command,
+            "command_id": block_id.to_string(),
+            "output": output,
+            "exit_code": exit_code.value(),
+        }),
+        ReadShellCommandOutputResult::LongRunningCommandSnapshot {
+            command,
+            block_id,
+            grid_contents,
+            cursor,
+            is_alt_screen_active,
+            is_preempted,
+        } => json!({
+            "status": "long_running",
+            "command": command,
+            "command_id": block_id.to_string(),
+            "output": grid_contents,
+            "cursor": cursor,
+            "is_alt_screen_active": is_alt_screen_active,
+            "is_preempted": is_preempted,
+        }),
+        ReadShellCommandOutputResult::Cancelled => json!({
+            "status": "cancelled",
+        }),
+        ReadShellCommandOutputResult::Error(_) => json!({
+            "status": "error",
+            "error_type": "command_not_found",
+        }),
+    }
+}
+
+fn serialize_read_files_result(result: &ReadFilesResult) -> Value {
+    match result {
+        ReadFilesResult::Success { files } => json!({
+            "status": "success",
+            "files": files.iter().map(serialize_file_context).collect::<Vec<_>>(),
+        }),
+        ReadFilesResult::Error(message) => json!({
+            "status": "error",
+            "message": message,
+        }),
+        ReadFilesResult::Cancelled => json!({
+            "status": "cancelled",
+        }),
+    }
+}
+
+fn serialize_search_codebase_result(result: &SearchCodebaseResult) -> Value {
+    match result {
+        SearchCodebaseResult::Success { files } => json!({
+            "status": "success",
+            "files": files.iter().map(serialize_file_context).collect::<Vec<_>>(),
+        }),
+        SearchCodebaseResult::Failed { reason, message } => json!({
+            "status": "error",
+            "reason": format!("{reason:?}"),
+            "message": message,
+        }),
+        SearchCodebaseResult::Cancelled => json!({
+            "status": "cancelled",
+        }),
+    }
+}
+
+fn serialize_read_skill_result(result: &ReadSkillResult) -> Value {
+    match result {
+        ReadSkillResult::Success { content } => json!({
+            "status": "success",
+            "skill": serialize_file_context(content),
+        }),
+        ReadSkillResult::Error(message) => json!({
+            "status": "error",
+            "message": message,
+        }),
+        ReadSkillResult::Cancelled => json!({
+            "status": "cancelled",
+        }),
+    }
+}
+
+fn serialize_file_context(file: &FileContext) -> Value {
+    let mut value = serde_json::Map::new();
+    value.insert("file_path".to_string(), Value::String(file.file_name.clone()));
+    if let Some(line_range) = &file.line_range {
+        value.insert(
+            "line_range".to_string(),
+            serialize_file_context_line_range(line_range),
+        );
+    }
+
+    match &file.content {
+        AnyFileContent::StringContent(content) => {
+            value.insert("content_type".to_string(), Value::String("text".to_string()));
+            value.insert("content".to_string(), Value::String(content.clone()));
+        }
+        AnyFileContent::BinaryContent(content) => {
+            value.insert(
+                "content_type".to_string(),
+                Value::String("binary".to_string()),
+            );
+            value.insert(
+                "content".to_string(),
+                Value::String("<binary>".to_string()),
+            );
+            value.insert(
+                "size_bytes".to_string(),
+                Value::Number((content.len() as u64).into()),
+            );
+        }
+    }
+
+    Value::Object(value)
+}
+
+fn serialize_file_context_line_range(line_range: &std::ops::Range<usize>) -> Value {
+    json!({
+        "start": line_range.start,
+        "end": line_range.end,
+    })
 }
 
 fn serialize_ask_user_question_result(result: &AskUserQuestionResult) -> Value {

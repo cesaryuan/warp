@@ -2,8 +2,12 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use ai::agent::action_result::{
-    AIAgentActionResultType, AskUserQuestionAnswerItem, AskUserQuestionResult, ReadFilesResult,
+    AIAgentActionResultType, AnyFileContent, AskUserQuestionAnswerItem, AskUserQuestionResult,
+    FileContext, ReadFilesResult, ReadShellCommandOutputResult, ReadSkillResult,
+    RequestCommandOutputResult, SearchCodebaseResult, WriteToLongRunningShellCommandResult,
 };
+use warp_core::command::ExitCode;
+use warp_terminal::model::BlockId;
 use warp_multi_agent_api as api;
 
 use super::request::{
@@ -1715,6 +1719,213 @@ fn convert_inputs_to_response_items_serializes_ask_user_question_answers() {
     assert_eq!(output["answers"][0]["other_text"], "");
     assert_eq!(output["answers"][1]["question_id"], "q2");
     assert_eq!(output["answers"][1]["skipped"], true);
+}
+
+/// Verifies shell-related tool results retain structured fields in function_call_output.
+#[test]
+fn convert_inputs_to_response_items_serializes_shell_tool_results() {
+    let inputs = vec![
+        AIAgentInput::ActionResult {
+            result: AIAgentActionResult {
+                id: "call_run".to_string().into(),
+                task_id: TaskId::new("task".to_string()),
+                result: AIAgentActionResultType::RequestCommandOutput(
+                    RequestCommandOutputResult::Completed {
+                        block_id: BlockId::from("cmd-1".to_string()),
+                        command: "rg TODO .".to_string(),
+                        output: "src/main.rs:12: TODO".to_string(),
+                        exit_code: ExitCode::from(0),
+                    },
+                ),
+            },
+            context: std::sync::Arc::new([]),
+        },
+        AIAgentInput::ActionResult {
+            result: AIAgentActionResult {
+                id: "call_write".to_string().into(),
+                task_id: TaskId::new("task".to_string()),
+                result: AIAgentActionResultType::WriteToLongRunningShellCommand(
+                    WriteToLongRunningShellCommandResult::Snapshot {
+                        block_id: BlockId::from("cmd-2".to_string()),
+                        grid_contents: "dev server ready".to_string(),
+                        cursor: ">".to_string(),
+                        is_alt_screen_active: false,
+                        is_preempted: true,
+                    },
+                ),
+            },
+            context: std::sync::Arc::new([]),
+        },
+        AIAgentInput::ActionResult {
+            result: AIAgentActionResult {
+                id: "call_read_output".to_string().into(),
+                task_id: TaskId::new("task".to_string()),
+                result: AIAgentActionResultType::ReadShellCommandOutput(
+                    ReadShellCommandOutputResult::LongRunningCommandSnapshot {
+                        command: "npm run dev".to_string(),
+                        block_id: BlockId::from("cmd-3".to_string()),
+                        grid_contents: "listening on 3000".to_string(),
+                        cursor: "_".to_string(),
+                        is_alt_screen_active: true,
+                        is_preempted: false,
+                    },
+                ),
+            },
+            context: std::sync::Arc::new([]),
+        },
+    ];
+
+    let items = convert_inputs_to_response_items(&inputs).expect("inputs should convert");
+    assert_eq!(items.len(), 3);
+
+    let run_output: serde_json::Value = serde_json::from_str(
+        items[0]["output"]
+            .as_str()
+            .expect("run_shell_command output should be a string"),
+    )
+    .expect("run_shell_command output should be valid json");
+    assert_eq!(run_output["status"], "completed");
+    assert_eq!(run_output["command"], "rg TODO .");
+    assert_eq!(run_output["command_id"], "cmd-1");
+    assert_eq!(run_output["output"], "src/main.rs:12: TODO");
+    assert_eq!(run_output["exit_code"], 0);
+
+    let write_output: serde_json::Value = serde_json::from_str(
+        items[1]["output"]
+            .as_str()
+            .expect("write_to_long_running_shell_command output should be a string"),
+    )
+    .expect("write_to_long_running_shell_command output should be valid json");
+    assert_eq!(write_output["status"], "long_running");
+    assert_eq!(write_output["command_id"], "cmd-2");
+    assert_eq!(write_output["output"], "dev server ready");
+    assert_eq!(write_output["cursor"], ">");
+    assert_eq!(write_output["is_preempted"], true);
+
+    let read_output: serde_json::Value = serde_json::from_str(
+        items[2]["output"]
+            .as_str()
+            .expect("read_shell_command_output output should be a string"),
+    )
+    .expect("read_shell_command_output output should be valid json");
+    assert_eq!(read_output["status"], "long_running");
+    assert_eq!(read_output["command"], "npm run dev");
+    assert_eq!(read_output["command_id"], "cmd-3");
+    assert_eq!(read_output["output"], "listening on 3000");
+    assert_eq!(read_output["cursor"], "_");
+    assert_eq!(read_output["is_alt_screen_active"], true);
+}
+
+/// Verifies file-oriented tool results keep structured content in function_call_output.
+#[test]
+fn convert_inputs_to_response_items_serializes_file_and_search_results() {
+    let inputs = vec![
+        AIAgentInput::ActionResult {
+            result: AIAgentActionResult {
+                id: "call_read_files".to_string().into(),
+                task_id: TaskId::new("task".to_string()),
+                result: AIAgentActionResultType::ReadFiles(ReadFilesResult::Success {
+                    files: vec![
+                        FileContext::new(
+                            "src/lib.rs".to_string(),
+                            AnyFileContent::StringContent("fn main() {}\n".to_string()),
+                            Some(1..2),
+                            None,
+                        ),
+                        FileContext::new(
+                            "assets/logo.png".to_string(),
+                            AnyFileContent::BinaryContent(vec![1, 2, 3, 4]),
+                            None,
+                            None,
+                        ),
+                    ],
+                }),
+            },
+            context: std::sync::Arc::new([]),
+        },
+        AIAgentInput::ActionResult {
+            result: AIAgentActionResult {
+                id: "call_search".to_string().into(),
+                task_id: TaskId::new("task".to_string()),
+                result: AIAgentActionResultType::SearchCodebase(SearchCodebaseResult::Success {
+                    files: vec![FileContext::new(
+                        "src/search.rs".to_string(),
+                        AnyFileContent::StringContent("pub fn search() {}\n".to_string()),
+                        None,
+                        None,
+                    )],
+                }),
+            },
+            context: std::sync::Arc::new([]),
+        },
+    ];
+
+    let items = convert_inputs_to_response_items(&inputs).expect("inputs should convert");
+    assert_eq!(items.len(), 2);
+
+    let read_files_output: serde_json::Value = serde_json::from_str(
+        items[0]["output"]
+            .as_str()
+            .expect("read_files output should be a string"),
+    )
+    .expect("read_files output should be valid json");
+    assert_eq!(read_files_output["status"], "success");
+    assert_eq!(read_files_output["files"][0]["file_path"], "src/lib.rs");
+    assert_eq!(read_files_output["files"][0]["line_range"]["start"], 1);
+    assert_eq!(read_files_output["files"][0]["line_range"]["end"], 2);
+    assert_eq!(read_files_output["files"][0]["content_type"], "text");
+    assert_eq!(read_files_output["files"][0]["content"], "fn main() {}\n");
+    assert_eq!(read_files_output["files"][1]["file_path"], "assets/logo.png");
+    assert_eq!(read_files_output["files"][1]["content_type"], "binary");
+    assert_eq!(read_files_output["files"][1]["content"], "<binary>");
+    assert_eq!(read_files_output["files"][1]["size_bytes"], 4);
+
+    let search_output: serde_json::Value = serde_json::from_str(
+        items[1]["output"]
+            .as_str()
+            .expect("search_codebase output should be a string"),
+    )
+    .expect("search_codebase output should be valid json");
+    assert_eq!(search_output["status"], "success");
+    assert_eq!(search_output["files"][0]["file_path"], "src/search.rs");
+    assert_eq!(search_output["files"][0]["content"], "pub fn search() {}\n");
+}
+
+/// Verifies read_skill results return the skill path and content in function_call_output.
+#[test]
+fn convert_inputs_to_response_items_serializes_read_skill_results() {
+    let inputs = vec![AIAgentInput::ActionResult {
+        result: AIAgentActionResult {
+            id: "call_skill".to_string().into(),
+            task_id: TaskId::new("task".to_string()),
+            result: AIAgentActionResultType::ReadSkill(ReadSkillResult::Success {
+                content: FileContext::new(
+                    "skills/test/SKILL.md".to_string(),
+                    AnyFileContent::StringContent("# Test Skill\nFollow the instructions.\n".to_string()),
+                    None,
+                    None,
+                ),
+            }),
+        },
+        context: std::sync::Arc::new([]),
+    }];
+
+    let items = convert_inputs_to_response_items(&inputs).expect("inputs should convert");
+    assert_eq!(items.len(), 1);
+
+    let output: serde_json::Value = serde_json::from_str(
+        items[0]["output"]
+            .as_str()
+            .expect("read_skill output should be a string"),
+    )
+    .expect("read_skill output should be valid json");
+    assert_eq!(output["status"], "success");
+    assert_eq!(output["skill"]["file_path"], "skills/test/SKILL.md");
+    assert_eq!(output["skill"]["content_type"], "text");
+    assert_eq!(
+        output["skill"]["content"],
+        "# Test Skill\nFollow the instructions.\n"
+    );
 }
 
 /// Verifies that local request inputs are mirrored into persisted task messages for restore.
