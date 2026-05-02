@@ -161,7 +161,7 @@ pub(super) fn built_in_tool_schema(tool_type: api::ToolType) -> Option<Value> {
             true,
         )),
         api::ToolType::FileGlob => None,
-        api::ToolType::FileGlob | api::ToolType::FileGlobV2 => Some(function_schema(
+        api::ToolType::FileGlobV2 => Some(function_schema(
             "file_glob",
             "Usage:\n- Use this tool when you need to find files by name patterns rather than content.\n- Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\".\n- Does not match directories (like `find -type f`).",
             json!({
