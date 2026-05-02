@@ -137,7 +137,8 @@ function Resolve-BaseRef {
     param(
         [string]$ExplicitBaseRef,
         [string]$TargetTag,
-        [string]$TargetRef
+        [string]$TargetRef,
+        [string]$TargetCommitSha
     )
 
     if (-not [string]::IsNullOrWhiteSpace($ExplicitBaseRef)) {
@@ -159,7 +160,16 @@ function Resolve-BaseRef {
     }
 
     foreach ($candidate in $tags) {
-        if ($candidate -ne $TargetTag) {
+        if ($candidate -eq $TargetTag) {
+            continue
+        }
+
+        $candidateCommitSha = Get-CommitSha -Ref $candidate
+        if (-not [string]::IsNullOrWhiteSpace($TargetCommitSha) -and $candidateCommitSha -eq $TargetCommitSha) {
+            continue
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
             return $candidate
         }
     }
@@ -436,7 +446,7 @@ if ([string]::IsNullOrWhiteSpace($Tag)) {
     $Tag = New-ReleaseTag -ReleaseChannel $Channel -SkipRemoteCheck
 }
 
-$effectiveBaseRef = Resolve-BaseRef -ExplicitBaseRef $BaseRef -TargetTag $Tag -TargetRef $ToRef
+$effectiveBaseRef = Resolve-BaseRef -ExplicitBaseRef $BaseRef -TargetTag $Tag -TargetRef $ToRef -TargetCommitSha $targetCommitSha
 $commitSubjects = Get-CommitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef -CommitAuthorPattern $AuthorPattern
 $notesBody = Build-ReleaseNotes -Subjects $commitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef -GitHubRepo $gitHubRepo -TargetCommitSha $targetCommitSha
 $resolvedNotesPath = Get-NotesFilePath -ExplicitPath $NotesPath -ReleaseTag $Tag
@@ -469,7 +479,7 @@ $existingReleaseTag = Find-ExistingReleaseTagForCommit -CommitSha $targetCommitS
 if (-not [string]::IsNullOrWhiteSpace($existingReleaseTag) -and $existingReleaseTag -ne $Tag) {
     $Tag = $existingReleaseTag
     $reusedExistingRelease = $true
-    $effectiveBaseRef = Resolve-BaseRef -ExplicitBaseRef $BaseRef -TargetTag $Tag -TargetRef $ToRef
+    $effectiveBaseRef = Resolve-BaseRef -ExplicitBaseRef $BaseRef -TargetTag $Tag -TargetRef $ToRef -TargetCommitSha $targetCommitSha
     $commitSubjects = Get-CommitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef -CommitAuthorPattern $AuthorPattern
     $notesBody = Build-ReleaseNotes -Subjects $commitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef -GitHubRepo $gitHubRepo -TargetCommitSha $targetCommitSha
     $resolvedNotesPath = Get-NotesFilePath -ExplicitPath $NotesPath -ReleaseTag $Tag
@@ -477,7 +487,7 @@ if (-not [string]::IsNullOrWhiteSpace($existingReleaseTag) -and $existingRelease
     $title = "$releaseBaseName $Tag"
 } elseif (-not $reusedExistingRelease -and -not (Test-ReleaseExists -ReleaseTag $Tag -GitHubRepo $gitHubRepo) -and -not $PSBoundParameters.ContainsKey('Tag')) {
     $Tag = New-ReleaseTag -ReleaseChannel $Channel -GitHubRepo $gitHubRepo
-    $effectiveBaseRef = Resolve-BaseRef -ExplicitBaseRef $BaseRef -TargetTag $Tag -TargetRef $ToRef
+    $effectiveBaseRef = Resolve-BaseRef -ExplicitBaseRef $BaseRef -TargetTag $Tag -TargetRef $ToRef -TargetCommitSha $targetCommitSha
     $commitSubjects = Get-CommitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef -CommitAuthorPattern $AuthorPattern
     $notesBody = Build-ReleaseNotes -Subjects $commitSubjects -StartRef $effectiveBaseRef -EndRef $ToRef -GitHubRepo $gitHubRepo -TargetCommitSha $targetCommitSha
     $resolvedNotesPath = Get-NotesFilePath -ExplicitPath $NotesPath -ReleaseTag $Tag
