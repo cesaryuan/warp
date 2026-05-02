@@ -38,7 +38,7 @@ EXISTING_TAG_ON_COMMIT="$(
   git tag --points-at "$CURRENT_COMMIT" \
     | grep "\.${CHANNEL}_[0-9][0-9]$" \
     | sort -r --version-sort \
-    | head -n1
+    | head -n1 || true
 )"
 
 finish_success() {
@@ -49,7 +49,12 @@ finish_success() {
 
 if [[ "$GIT_BRANCH_NAME" == "$RELEASE_BRANCH_PREFIX/"* ]]; then
     echo >&2  "Already on release branch $GIT_BRANCH_NAME, not creating new one."
-    tag=$(git tag | grep "${GIT_BRANCH_NAME#"$RELEASE_BRANCH_PREFIX/"}" | sort -r --version-sort | head -n1)
+    tag="$(
+        git tag \
+          | grep "${GIT_BRANCH_NAME#"$RELEASE_BRANCH_PREFIX/"}" \
+          | sort -r --version-sort \
+          | head -n1 || true
+    )"
     echo >&2 "Current tag on branch is $tag"
     if git rev-parse "$tag" >/dev/null 2>&1; then
         # Tag already exists, increase the RC number
