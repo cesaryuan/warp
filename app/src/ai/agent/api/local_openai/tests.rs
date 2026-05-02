@@ -1,7 +1,9 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use ai::agent::action_result::{AIAgentActionResultType, ReadFilesResult};
+use ai::agent::action_result::{
+    AIAgentActionResultType, AskUserQuestionAnswerItem, AskUserQuestionResult, ReadFilesResult,
+};
 use warp_multi_agent_api as api;
 
 use super::request::{
@@ -1672,6 +1674,47 @@ fn convert_inputs_to_response_items_supports_user_query_and_action_result() {
     assert_eq!(items.len(), 2);
     assert_eq!(items[0]["role"], "user");
     assert_eq!(items[1]["type"], "function_call_output");
+}
+
+/// Verifies ask_user_question tool results keep structured answers in function_call_output.
+#[test]
+fn convert_inputs_to_response_items_serializes_ask_user_question_answers() {
+    let inputs = vec![AIAgentInput::ActionResult {
+        result: AIAgentActionResult {
+            id: "call_ask".to_string().into(),
+            task_id: TaskId::new("task".to_string()),
+            result: AIAgentActionResultType::AskUserQuestion(AskUserQuestionResult::Success {
+                answers: vec![
+                    AskUserQuestionAnswerItem::Answered {
+                        question_id: "q1".to_string(),
+                        selected_options: vec!["回答一个具体问题".to_string()],
+                        other_text: String::new(),
+                    },
+                    AskUserQuestionAnswerItem::Skipped {
+                        question_id: "q2".to_string(),
+                    },
+                ],
+            }),
+        },
+        context: std::sync::Arc::new([]),
+    }];
+
+    let items = convert_inputs_to_response_items(&inputs).expect("inputs should convert");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["type"], "function_call_output");
+    assert_eq!(items[0]["call_id"], "call_ask");
+
+    let output = items[0]["output"]
+        .as_str()
+        .expect("ask_user_question output should be a string");
+    let output: serde_json::Value =
+        serde_json::from_str(output).expect("ask_user_question output should be valid json");
+    assert_eq!(output["status"], "success");
+    assert_eq!(output["answers"][0]["question_id"], "q1");
+    assert_eq!(output["answers"][0]["selected_options"][0], "回答一个具体问题");
+    assert_eq!(output["answers"][0]["other_text"], "");
+    assert_eq!(output["answers"][1]["question_id"], "q2");
+    assert_eq!(output["answers"][1]["skipped"], true);
 }
 
 /// Verifies that local request inputs are mirrored into persisted task messages for restore.

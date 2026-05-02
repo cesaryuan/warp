@@ -10,7 +10,10 @@ use uuid::Uuid;
 use warp_multi_agent_api as api;
 
 use crate::ai::agent::api::{convert_to::convert_input, user_inputs_from_messages};
-use crate::ai::agent::{AIAgentContext, AIAgentInput, MCPContext, MCPServer};
+use crate::ai::agent::{
+    AIAgentActionResult, AIAgentActionResultType, AIAgentContext, AIAgentInput,
+    AskUserQuestionAnswerItem, AskUserQuestionResult, MCPContext, MCPServer,
+};
 use crate::server::server_api::ServerApi;
 
 use super::tool_schemas::built_in_tool_schema;
@@ -164,7 +167,7 @@ pub(super) fn convert_inputs_to_response_items(
             AIAgentInput::ActionResult { result, .. } => {
                 items.push(function_call_output_item(
                     result.id.to_string(),
-                    result.to_string(),
+                    serialize_tool_result_output(result),
                 ));
             }
             AIAgentInput::AutoCodeDiffQuery { query, context }
@@ -553,6 +556,63 @@ fn function_call_output_item(call_id: String, output: String) -> Value {
         "call_id": call_id,
         "output": output,
     })
+}
+
+fn serialize_tool_result_output(result: &AIAgentActionResult) -> String {
+    match &result.result {
+        AIAgentActionResultType::AskUserQuestion(ask_result) => {
+            serialize_ask_user_question_result(ask_result).to_string()
+        }
+        _ => result.to_string(),
+    }
+}
+
+fn serialize_ask_user_question_result(result: &AskUserQuestionResult) -> Value {
+    match result {
+        AskUserQuestionResult::Success { answers } => json!({
+            "status": "success",
+            "answers": answers
+                .iter()
+                .map(serialize_ask_user_question_answer_item)
+                .collect::<Vec<_>>(),
+        }),
+        AskUserQuestionResult::Error(message) => json!({
+            "status": "error",
+            "message": message,
+        }),
+        AskUserQuestionResult::Cancelled => json!({
+            "status": "cancelled",
+        }),
+        AskUserQuestionResult::SkippedByAutoApprove { question_ids } => json!({
+            "status": "skipped_by_auto_approve",
+            "question_ids": question_ids,
+            "answers": question_ids
+                .iter()
+                .map(|question_id| json!({
+                    "question_id": question_id,
+                    "skipped": true,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    }
+}
+
+fn serialize_ask_user_question_answer_item(answer: &AskUserQuestionAnswerItem) -> Value {
+    match answer {
+        AskUserQuestionAnswerItem::Answered {
+            question_id,
+            selected_options,
+            other_text,
+        } => json!({
+            "question_id": question_id,
+            "selected_options": selected_options,
+            "other_text": other_text,
+        }),
+        AskUserQuestionAnswerItem::Skipped { question_id } => json!({
+            "question_id": question_id,
+            "skipped": true,
+        }),
+    }
 }
 
 /// Builds the list of tool definitions exposed to the local Responses model.
