@@ -426,12 +426,21 @@ jobs:
       # break the macOS framework directory structure.
       - name: Create tar archive with build artifacts
         run: |
-          tar czfv build-artifacts.tar.gz \
-            ${{ steps.bundle_app.outputs.binary_path }} \
-            ${{ steps.bundle_app.outputs.dock_tile_plugin_dir }} \
-            ${{ steps.bundle_app.outputs.dsym_path }} \
-            ${{ steps.bundle_app.outputs.dsym_realpath }} \
-            ${{ steps.bundle_app.outputs.frameworks_dir }}
+          ARTIFACTS=(
+            "${{ steps.bundle_app.outputs.binary_path }}"
+            "${{ steps.bundle_app.outputs.dock_tile_plugin_dir }}"
+            "${{ steps.bundle_app.outputs.dsym_path }}"
+          )
+
+          if [[ -n "${{ steps.bundle_app.outputs.dsym_realpath }}" ]] && [[ -e "${{ steps.bundle_app.outputs.dsym_realpath }}" ]]; then
+            ARTIFACTS+=("${{ steps.bundle_app.outputs.dsym_realpath }}")
+          fi
+
+          if [[ -n "${{ steps.bundle_app.outputs.frameworks_dir }}" ]] && [[ -e "${{ steps.bundle_app.outputs.frameworks_dir }}" ]]; then
+            ARTIFACTS+=("${{ steps.bundle_app.outputs.frameworks_dir }}")
+          fi
+
+          tar czfv build-artifacts.tar.gz "${ARTIFACTS[@]}"
 
       - name: Archive ${{ matrix.arch }} build artifacts for universal build
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
