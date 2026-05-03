@@ -99,3 +99,14 @@ fn local_openai_backend_requires_opt_in_and_openai_provider() {
     params.model_provider = LLMProvider::OpenAI;
     assert!(should_use_local_openai_responses_backend(&params));
 }
+
+#[test]
+fn local_openai_backend_allows_remote_sessions() {
+    let mut params = request_params_with_ask_user_question_enabled(false);
+    params.local_openai_responses_backend_enabled = true;
+    params.model_provider = LLMProvider::OpenAI;
+    params.session_context =
+        SessionContext::new_remote_for_test(Some(warp_core::HostId::new("host-1".to_string())));
+
+    assert!(should_use_local_openai_responses_backend(&params));
+}

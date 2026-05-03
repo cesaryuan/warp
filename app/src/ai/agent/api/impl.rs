@@ -170,10 +170,8 @@ pub async fn generate_multi_agent_output(
 pub(super) fn should_use_local_openai_responses_backend(params: &RequestParams) -> bool {
     params.local_openai_responses_backend_enabled
         && matches!(params.model_provider, crate::ai::llms::LLMProvider::OpenAI)
-        && matches!(
-            params.session_context.session_type(),
-            None | Some(SessionType::Local)
-        )
+        // Local OpenAI requests are sent from the client regardless of whether
+        // the active terminal session is local or SSH-backed.
         && params.ambient_agent_task_id.is_none()
         && !params.orchestration_enabled
         && params.target_task_id.is_some()
