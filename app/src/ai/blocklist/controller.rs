@@ -124,6 +124,17 @@ impl SessionContext {
     }
 
     #[cfg(test)]
+    /// Creates a remote session context for unit tests.
+    pub fn new_remote_for_test(host_id: Option<warp_core::HostId>) -> Self {
+        SessionContext {
+            session_type: Some(SessionType::WarpifiedRemote { host_id }),
+            shell: None,
+            current_working_directory: None,
+        }
+    }
+
+    #[cfg(test)]
+    /// Creates a default session context for unit tests.
     pub fn new_for_test() -> Self {
         SessionContext {
             session_type: None,

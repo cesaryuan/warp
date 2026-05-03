@@ -32,6 +32,8 @@ CI 的 Windows release 实际是两段式调用同一个脚本：先 `-SkipBuild
 
 本地 `local_openai` 后端要显示 Warp 里的 thinking / `Thought for N seconds`，关键不是“拿到最终 answer”就够了，而是要主动请求并解析 reasoning 流。请求侧对 reasoning 模型补 `reasoning.summary = "auto"`，流式侧同时接 `response.reasoning_summary_text.*`、兼容 `response.reasoning_text.*`，并把完成时长落到 Warp 的 `AgentReasoning`，这样 UI 才能稳定显示思考过程和耗时。
 
+如果发现 Local OpenAI 在普通终端能用、切到 SSH Agent 就失效，先检查 `app/src/ai/agent/api/impl.rs` 里的 `should_use_local_openai_responses_backend`。这里以前把 `WarpifiedRemote` session 全排除了，导致 SSH 场景不会走本地 provider，而会落回服务端请求链路；服务端链路又不会使用本地配置的 `openai_base_url`，所以看起来就像“SSH 下 Local OpenAI 坏了”。后续如果再改这条 gating，记得同时保住远端 session 的单测。
+
 `encrypted_content` 不是可有可无的附带字段；在 `store: false` 的本地手动回放模式里，它是多轮 reasoning / tool use 续上下文的关键。请求里要带 `include: ["reasoning.encrypted_content"]`，回放时要把 `reasoning` item 连同 `encrypted_content` 一起传回去，而且不要回传 `id`；`summary` 即使是空数组 `[]` 也不能省略。
 
 不要只信 `response.completed.output`。实际 provider 可能会在 SSE 的 `response.output_item.done` 里给出 reasoning 和 `encrypted_content`，但在最终 completed 里漏掉它；如果只在 completed 阶段建 history，下一轮就会丢推理上下文。更稳妥的做法是流式阶段先按顺序缓存 replayable history，再在 finalize 时和 completed 输出合并。
